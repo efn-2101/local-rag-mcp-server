@@ -288,12 +288,14 @@ python _cleanup_db.py
 
 ```json
 {
-  "local-rag": {
-    "url": "http://localhost:8000/sse",
-    "headers": {
-      "x-api-key": "your-api-key-here",
-      "x-roots": "Group A",
-      "x-categories": ""
+  "mcpServers": {
+    "local-rag": {
+      "url": "http://localhost:8000/sse",
+      "headers": {
+        "x-api-key": "your-api-key-here",
+        "x-roots": "Group A",
+        "x-categories": ""
+      }
     }
   }
 }
@@ -314,10 +316,12 @@ CLINE の仕様上、`x-roots` / `x-categories` **ヘッダー**で日本語を�
 
 ```json
 {
-  "local-rag": {
-    "url": "http://localhost:8000/sse?categories=カテゴリA,カテゴリB",
-    "headers": {
-      "x-api-key": "your-api-key-here"
+  "mcpServers": {
+    "local-rag": {
+      "url": "http://localhost:8000/sse?categories=カテゴリA,カテゴリB",
+      "headers": {
+        "x-api-key": "your-api-key-here"
+      }
     }
   }
 }
