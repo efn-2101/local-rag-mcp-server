@@ -1,0 +1,16 @@
+{
+  "_comment": "MCPサーバーのグループアクセス制御設定ファイル。このファイルをコピーして acl.json として使用してください。",
+  "_default": {
+    "name": "Public",
+    "allowed_roots": [
+      "Public"
+    ]
+  },
+  "ランダムなAPIキー文字列をここに記入": {
+    "name": "グループ名（例: Group A）",
+    "allowed_roots": [
+      "Group A",
+      "Public"
+    ]
+  }
+}

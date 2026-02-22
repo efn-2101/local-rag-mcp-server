@@ -1,0 +1,9 @@
+{
+  "source_docs_dir": "C:\\path\\to\\your\\documents",
+  "docs_dir": "converted_docs",
+  "embedding_model": "nomic-embed-text-v2-moe:latest",
+  "ocr_model": "glm-ocr:latest",
+  "ollama_base_url": "http://localhost:11434",
+  "db_dir": "./chroma_db",
+  "collection_name": "mcp_rag_collection"
+}

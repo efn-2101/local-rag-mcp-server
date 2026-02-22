@@ -1,0 +1,11 @@
+mcp
+starlette
+uvicorn
+ollama
+chromadb
+Pillow
+watchdog
+pymupdf
+openpyxl
+python-docx
+python-pptx

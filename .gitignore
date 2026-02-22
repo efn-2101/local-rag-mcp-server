@@ -1,0 +1,23 @@
+# === 設定ファイル（個人情報・APIキー含む） ===
+config.json
+acl.json
+
+# === データ・キャッシュ ===
+chroma_db/
+converted_docs/
+documents/
+index.lock
+
+# === ログ ===
+*.log
+
+# === Python ===
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# === OS ===
+.DS_Store
+Thumbs.db
