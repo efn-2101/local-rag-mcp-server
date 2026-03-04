@@ -329,6 +329,8 @@ async def handle_call_tool(
             # done/error 状態の場合は idle にリセットして再同期を許可
             if cur_status in ("done", "error"):
                 sync_state["status"] = "idle"
+                sync_state["progress"] = "開始準備中..."
+                sync_state["last_result"] = None
 
         allowed = _get_allowed()
         t = threading.Thread(target=_run_sync_background, args=(force_flag, allowed), daemon=True)
@@ -346,7 +348,7 @@ async def handle_call_tool(
         if state["last_result"]:
             text += f"\n最終結果: {state['last_result'].get('message', '')}"
         if state["status"] == "done":
-            text += "\n\n⇒ 同期が完了しました。これ以上のポーリングは不要です。"
+            text += "\n\n⇒ 前回の同期プロセスは完了しています。新たに追加されたファイルをインデックスに反映させる場合は、再度 update_index を実行してください。"
         elif state["status"] == "error":
             text += "\n\n⇒ エラーが発生しました。update_index で再実行できます。"
         return [types.TextContent(type="text", text=text)]

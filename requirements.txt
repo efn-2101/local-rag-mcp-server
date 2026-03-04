@@ -5,7 +5,16 @@ ollama
 chromadb
 Pillow
 watchdog
+psutil
 pymupdf
 openpyxl
 python-docx
 python-pptx
+
+# --- OCR Dependencies ---
+# PaddleOCR engine (Stable stack: paddleocr 2.7.3, paddlepaddle 2.6.2, numpy < 2.0.0)
+paddleocr==2.7.3
+numpy<2.0.0
+# Note: Users must manually install the appropriate PaddlePaddle backend.
+# For CPU: pip install paddlepaddle==2.6.2
+# For GPU: pip install paddlepaddle-gpu==2.6.2
