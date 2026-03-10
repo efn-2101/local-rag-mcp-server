@@ -1,15 +1,14 @@
 import os
 os.environ["CHROMA_TELEMETRY"] = "FALSE"
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 # 以下の設定でRustバックエンドでのSQLite不具合やアクセス違反を回避（もし動作するなら）
 # os.environ["CHROMA_RUST_BINDINGS"] = "FALSE"
 import json
-import base64
 import sys
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 import ollama
 import chromadb
-from chromadb.utils import embedding_functions
 
 
 
@@ -38,6 +37,10 @@ class RagEngine:
         
         # Ollama client
         self.ollama_client = ollama.Client(host=self.config["ollama_base_url"])
+        
+        # Additional text extensions from config
+        self.extra_text_extensions = self.config.get("extra_text_extensions", [])
+        self.allowed_extensions = [".md", ".txt"] + self.extra_text_extensions
         
         try:
             self.client = chromadb.PersistentClient(path=str(db_path))
@@ -110,7 +113,8 @@ class RagEngine:
 
             chunks.append(chunk)
             start = end - overlap # Move back by overlap
-            if start < 0: start = 0 # Safety
+            if start < 0:
+                start = 0 # Safety
             
             # Avoid infinite loop if overlap >= chunk size (should not happen with defaults)
             if end <= start:
@@ -124,7 +128,7 @@ class RagEngine:
             return
             
         # Only process markdown/text files for now
-        if file_path.suffix.lower() not in [".md", ".txt"]:
+        if file_path.suffix.lower() not in self.allowed_extensions:
             return
 
         category = file_path.parent.name if file_path.parent != self.docs_dir else "default"
@@ -351,7 +355,6 @@ class RagEngine:
                 print("Acquired index lock. Starting sync...", file=sys.stderr)
 
                 # --- Step 1: PDF/画像等を converted_docs/ に変換 ---
-                base_dir = Path(__file__).parent.absolute()
                 source_docs_dir_conf = self.config.get("source_docs_dir", "")
                 if source_docs_dir_conf:
                     source_dir = Path(source_docs_dir_conf).resolve()
@@ -401,8 +404,6 @@ class RagEngine:
                         if not md_file.is_file():
                             continue
                         # ACL: 許可カテゴリ外はスキップ
-                        md_root = md_file.relative_to(self.docs_dir).parts
-                        md_root_name = md_root[0] if len(md_root) > 0 else ""
                         if md_file.resolve() not in valid_md_files:
                             print(f"Removing orphaned file: {md_file}", file=sys.stderr)
                             try:
@@ -452,7 +453,7 @@ class RagEngine:
                     if not file_path.is_file():
                         continue
                         
-                    if file_path.suffix.lower() not in [".md", ".txt"]:
+                    if file_path.suffix.lower() not in self.allowed_extensions:
                         continue
                         
                     rel_path = str(file_path.relative_to(self.docs_dir)).replace("\\", "/")

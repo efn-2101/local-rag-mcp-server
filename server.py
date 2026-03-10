@@ -143,8 +143,6 @@ sync_state: dict = {"status": "idle", "progress": "", "last_result": None}
 _sync_lock = threading.Lock()
 
 def _run_sync_background(force: bool, allowed_roots: Optional[set]):
-    global sync_state
-
     def on_progress(phase, current, total, filename):
         if phase == "converting":
             pct = int(current / total * 100) if total > 0 else 0

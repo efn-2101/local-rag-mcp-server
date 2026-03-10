@@ -1,5 +1,4 @@
 import psutil
-import sys
 import os
 
 def stop_server():

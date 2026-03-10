@@ -21,3 +21,10 @@ __pycache__/
 # === OS ===
 .DS_Store
 Thumbs.db
+test_logic.py
+test_chroma_db/chroma.sqlite3
+test_docs/test.conf
+test_docs/test.ini
+flake8_output.txt
+index_error.txt
+mypy_output.txt

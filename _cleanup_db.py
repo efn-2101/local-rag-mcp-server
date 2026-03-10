@@ -1,5 +1,5 @@
 """Remove backslash-path data from ChromaDB directly."""
-import sys
+import os
 from rag_engine import RagEngine
 
 engine = RagEngine()

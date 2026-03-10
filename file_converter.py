@@ -1,10 +1,10 @@
-import os
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional
 import ollama
 try:
+    import os
+    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
     from paddleocr import PaddleOCR
     PADDLE_OCR_AVAILABLE = True
 except ImportError:
@@ -35,6 +35,9 @@ class FileConverter:
         self.paddleocr_use_gpu = self.config.get("paddleocr_use_gpu", False)
         
         self.ollama_client = ollama.Client(host=self.config.get("ollama_base_url", "http://localhost:11434"))
+        
+        # Additional text extensions from config
+        self.extra_text_extensions = self.config.get("extra_text_extensions", [])
         
         self.paddle_ocr_instance = None
         if self.ocr_engine == "paddleocr":
@@ -81,7 +84,7 @@ class FileConverter:
             return False
         # プロンプトエコー検出: 出力がプロンプト文字列を含むか完全一致している場合
         if self._OCR_PROMPT in stripped:
-            print(f"OCR validation failed: prompt echo detected (model returned the prompt as output)", file=sys.stderr)
+            print("OCR validation failed: prompt echo detected (model returned the prompt as output)", file=sys.stderr)
             return False
         # 有効文字数チェック（空白を除く）
         non_space = stripped.replace(' ', '').replace('\n', '').replace('\t', '')
@@ -302,11 +305,11 @@ class FileConverter:
             ".java", ".kt",
             # その他
             ".sh", ".bash", ".bat", ".ps1", ".rb", ".php", ".swift", ".cs",
-        ]:
+        ] + self.extra_text_extensions:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f"# Source: {file_path.name}\n\n" + f.read()
-            except:
+            except Exception:
                 content = None
         
         if content:
