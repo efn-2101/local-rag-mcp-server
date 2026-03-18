@@ -17,6 +17,24 @@ __pycache__/
 *.py[cod]
 *.pyo
 .env
+.mypy_cache/
+
+# === ビルド成果物 ===
+dist/
+build/
+*.egg-info/
+*.egg
+
+# === PyInstaller ===
+*.spec
+*.manifest
+
+# === スタンドアロンビルド ===
+standalone/
+*.exe
+
+# === モデルキャッシュ ===
+models/
 
 # === OS ===
 .DS_Store
@@ -28,3 +46,8 @@ test_docs/test.ini
 flake8_output.txt
 index_error.txt
 mypy_output.txt
+test_ocr_engine.py
+docs/TEST_PLAN.md
+
+# === テストコード ===
+tests/

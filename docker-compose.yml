@@ -1,0 +1,64 @@
+# docker-compose.yml
+# Local RAG MCP Server - Docker Compose Configuration
+# ============================================
+#
+# 注意: Ollamaは外部サービスとして独立して稼働します
+# MCPサーバーは環境変数OLLAMA_BASE_URLで指定されたOllamaに接続します
+# デフォルト: http://host.docker.internal:11434（Docker Desktop環境）
+# Linux環境では: http://172.17.0.1:11434 または OllamaのホストIPを指定
+
+version: "3.8"
+
+services:
+  # ============================================
+  # MCP Server - RAGサーバー
+  # ============================================
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local-rag-mcp-server:latest
+    container_name: local-rag-mcp-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # ドキュメントディレクトリ（読み取り専用推奨）
+      - ${DOCS_DIR:-./documents}:/app/documents:ro
+      # 変換済みドキュメント
+      - converted_docs:/app/converted_docs
+      # ChromaDB永続化
+      - chroma_db:/app/chroma_db
+      # FlashRankモデルキャッシュ
+      - models:/app/models
+      # 設定ファイル
+      - ./config.json:/app/config.json:ro
+    environment:
+      # Ollama接続URL（環境変数で変更可能）
+      # Docker Desktop (Windows/Mac): host.docker.internal
+      # Linux: 172.17.0.1 または OllamaサーバーのIP
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - PYTHONUNBUFFERED=1
+    extra_hosts:
+      # Linux環境でhost.docker.internalを有効にする場合
+      - "host.docker.internal:host-gateway"
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/sse"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  converted_docs:
+    driver: local
+  chroma_db:
+    driver: local
+  models:
+    driver: local
+
+networks:
+  rag-network:
+    driver: bridge

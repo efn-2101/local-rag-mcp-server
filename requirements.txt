@@ -10,11 +10,24 @@ pymupdf>=1.23.22
 openpyxl>=3.1.2
 python-docx>=1.1.0
 python-pptx>=0.6.23
+urllib3>=2.0.0
+charset-normalizer>=3.0.0
 
-# --- OCR Dependencies ---
-# PaddleOCR engine (Compatible stack: paddleocr >= 2.7.3, paddlepaddle >= 2.6.0, numpy >= 1.23.2)
-paddleocr>=2.7.3
-numpy>=1.23.2
+# --- Search Engine Dependencies ---
+# rank_bm25 for in-memory fast keyword search (BM25 algorithm)
+rank_bm25>=0.2.2
+# flashrank for ultra-lightweight re-ranking based on ONNX runtime
+flashrank>=0.2.12
+
+# --- OCR Dependencies (Optional) ---
+# By default, Ollama OCR is used (requires Ollama server with glm-ocr model).
+# PaddleOCR is optional and can be installed separately if needed.
+#
+# To use PaddleOCR instead of Ollama:
+# 1. Install PaddleOCR dependencies:
+#    pip install paddleocr>=2.7.3 paddlepaddle>=2.6.0
+#    (For GPU support: pip install paddleocr>=2.7.3 paddlepaddle-gpu>=2.6.0)
+# 2. Set "ocr_engine": "paddleocr" in config.json
+#
+# Note: numpy>=1.23.2 is required for PaddleOCR (usually installed as dependency)
 # Note: Users must manually install the appropriate PaddlePaddle backend.
-# For CPU: pip install paddlepaddle>=2.6.0
-# For GPU: pip install paddlepaddle-gpu>=2.6.0

@@ -1,0 +1,90 @@
+# .dockerignore
+# Dockerビルド時に除外するファイル
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+*.egg
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# テスト・開発ファイル
+test_*.py
+*_test.py
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ドキュメント
+*.md
+!README.md
+docs/
+plans/
+
+# 設定ファイル（テンプレート以外）
+config.json
+*.local.json
+
+# データディレクトリ
+chroma_db/
+converted_docs/
+documents/
+models/
+*.db
+*.sqlite
+*.sqlite3
+
+# ログ・一時ファイル
+*.log
+*.tmp
+*.temp
+.cache/
+logs/
+
+# ビルド成果物
+build/
+dist/
+*.tar
+*.tar.gz
+*.zip
+
+# オフラインパッケージ
+offline-package/
+
+# Docker関連（ビルドコンテキストから除外）
+docker-compose.override.yml
+.docker/
+
+# 環境変数ファイル
+.env
+.env.*
+!.env.example
+
+# その他
+.DS_Store
+Thumbs.db
+*.bak
+*.backup

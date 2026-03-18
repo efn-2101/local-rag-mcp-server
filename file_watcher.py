@@ -11,38 +11,55 @@ class DocumentHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if not event.is_directory:
-            print(f"File modified: {event.src_path}", file=sys.stderr)
-            self.engine.add_document(Path(event.src_path))
+            try:
+                print(f"File modified: {event.src_path}", file=sys.stderr)
+                self.engine.add_document(Path(event.src_path))
+            except Exception as e:
+                print(f"Error handling modification for {event.src_path}: {e}", file=sys.stderr)
 
     def on_created(self, event):
         if not event.is_directory:
-            print(f"File created: {event.src_path}", file=sys.stderr)
-            self.engine.add_document(Path(event.src_path))
+            try:
+                print(f"File created: {event.src_path}", file=sys.stderr)
+                self.engine.add_document(Path(event.src_path))
+            except Exception as e:
+                print(f"Error handling creation for {event.src_path}: {e}", file=sys.stderr)
 
     def on_deleted(self, event):
         if not event.is_directory:
-            print(f"File deleted: {event.src_path}", file=sys.stderr)
-            # delete_documentは相対パスが必要
-            self.engine.delete_document(Path(event.src_path))
+            try:
+                print(f"File deleted: {event.src_path}", file=sys.stderr)
+                # delete_documentは相対パスが必要
+                self.engine.delete_document(Path(event.src_path))
+            except Exception as e:
+                print(f"Error handling deletion for {event.src_path}: {e}", file=sys.stderr)
 
     def on_moved(self, event):
         if not event.is_directory:
-            print(f"File moved from {event.src_path} to {event.dest_path}", file=sys.stderr)
-            self.engine.delete_document(Path(event.src_path))
-            self.engine.add_document(Path(event.dest_path))
+            try:
+                print(f"File moved from {event.src_path} to {event.dest_path}", file=sys.stderr)
+                self.engine.delete_document(Path(event.src_path))
+                self.engine.add_document(Path(event.dest_path))
+            except Exception as e:
+                print(f"Error handling move from {event.src_path} to {event.dest_path}: {e}", file=sys.stderr)
 
 def start_watcher(engine: RagEngine):
     handler = DocumentHandler(engine)
     observer = Observer()
-    observer.schedule(handler, str(engine.docs_dir), recursive=True)
-    observer.start()
-    print(f"Started watching {engine.docs_dir}", file=sys.stderr)
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+        observer.schedule(handler, str(engine.docs_dir), recursive=True)
+        observer.start()
+        print(f"Started watching {engine.docs_dir}", file=sys.stderr)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nStopping watcher...", file=sys.stderr)
+        finally:
+            observer.stop()
+            observer.join()
+    except Exception as e:
+        print(f"Failed to start watcher: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     engine = RagEngine()

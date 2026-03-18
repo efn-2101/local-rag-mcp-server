@@ -2,11 +2,36 @@
   "source_docs_dir": "C:\\path\\to\\your\\documents",
   "docs_dir": "converted_docs",
   "embedding_model": "nomic-embed-text-v2-moe:latest",
+  
   "ocr_engine": "ollama",
   "ocr_model": "glm-ocr:latest",
   "paddleocr_use_gpu": false,
+  
   "ollama_base_url": "http://localhost:11434",
   "extra_text_extensions": [".conf", ".ini", ".env", ".log"],
   "db_dir": "./chroma_db",
-  "collection_name": "mcp_rag_collection"
+  "collection_name": "mcp_rag_collection",
+  
+  "search_settings": {
+    "hybrid_search_enabled": true,
+    "reranking_enabled": true,
+    "flashrank_model": "ms-marco-MultiBERT-L-12",
+    "flashrank_cache_dir": "models/flashrank_cache",
+    "flashrank_offline_mode": false
+  },
+  
+  "_ocr_help": {
+    "ocr_engine": "OCR engine to use: 'ollama' (default) or 'paddleocr' (optional)",
+    "ocr_model": "Ollama model for OCR (default: glm-ocr:latest). Make sure the model is pulled in Ollama.",
+    "paddleocr_use_gpu": "Use GPU for PaddleOCR (only effective when ocr_engine='paddleocr'). Requires paddlepaddle-gpu.",
+    "note": "PaddleOCR is optional. If 'paddleocr' is specified but not installed, falls back to 'ollama'."
+  },
+  
+  "_search_settings_help": {
+    "hybrid_search_enabled": "Enable hybrid search (vector + BM25). Default: true",
+    "reranking_enabled": "Enable FlashRank reranking. Default: true",
+    "flashrank_model": "FlashRank model name. Default: ms-marco-MultiBERT-L-12",
+    "flashrank_cache_dir": "Directory to store FlashRank models. Default: models/flashrank_cache",
+    "flashrank_offline_mode": "Use offline mode (no internet connection). Set true after downloading models. Default: false"
+  }
 }

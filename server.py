@@ -18,6 +18,16 @@ import mcp.types as types
 from rag_engine import RagEngine
 from pathlib import Path
 from typing import Optional, Union, Any
+import functools
+import contextvars
+
+def _with_context(func):
+    """asyncio.to_thread (run_in_executor) で ContextVar を伝播させるためのラッパー"""
+    ctx = contextvars.copy_context()
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return ctx.run(func, *args, **kwargs)
+    return wrapper
 
 print("Initializing RAG Engine...", file=sys.stderr)
 engine = RagEngine()
@@ -242,6 +252,9 @@ async def handle_list_tools() -> list[types.Tool]:
 async def handle_call_tool(
     name: str, arguments: Optional[dict]
 ) -> list[Union[types.TextContent, types.ImageContent, types.EmbeddedResource]]:
+    import time
+    _start_time = time.time()
+    print(f"[DEBUG] handle_call_tool start: name={name}, ctx_allowed={_ctx_allowed.get()}", file=sys.stderr)
     if arguments is None:
         arguments = {}
 
@@ -259,16 +272,17 @@ async def handle_call_tool(
              effective_categories = None
 
         if effective_roots and len(effective_roots) == 1:
-            results = engine.search(query, root_folder=effective_roots[0], category=effective_categories, n_results=n_results)
+            results = await asyncio.to_thread(_with_context(engine.search), query, root_folder=effective_roots[0], category=effective_categories, n_results=n_results)
         elif effective_roots:
             merged = []
             # 複数ルートの場合は各ルートごとに検索してマージ
             for root in effective_roots:
-                merged.extend(engine.search(query, root_folder=root, category=effective_categories, n_results=n_results))
+                res = await asyncio.to_thread(_with_context(engine.search), query, root_folder=root, category=effective_categories, n_results=n_results)
+                merged.extend(res)
             merged.sort(key=lambda x: x.get("distance", 1.0))
             results = merged[:n_results]
         else:
-            results = engine.search(query, root_folder=None, category=effective_categories, n_results=n_results)
+            results = await asyncio.to_thread(_with_context(engine.search), query, root_folder=None, category=effective_categories, n_results=n_results)
 
         if not results:
             return [types.TextContent(type="text", text="No relevant documents found.")]
@@ -279,7 +293,7 @@ async def handle_call_tool(
         return [types.TextContent(type="text", text="\n".join(formatted))]
 
     elif name == "list_roots":
-        roots = engine.get_roots()
+        roots = await asyncio.to_thread(_with_context(engine.get_roots))
         allowed = _get_allowed()
         if allowed is not None:
             roots = [c for c in roots if c in allowed]
@@ -287,24 +301,40 @@ async def handle_call_tool(
 
     elif name == "list_categories":
         allowed = _get_allowed()
-        categories = engine.get_categories(allowed_roots=allowed)
+        categories = await asyncio.to_thread(_with_context(engine.get_categories), allowed_roots=allowed)
         return [types.TextContent(type="text", text=f"Available categories: {', '.join(categories)}")]
 
     elif name == "get_document_content":
         doc_path = arguments.get("path", "")
+        # 厳密なパス・トラバーサル対策
+        try:
+            # engine.docs_dir は RagEngine 初期化時に resolve 済み
+            requested_path = (engine.docs_dir / doc_path).resolve()
+            if not str(requested_path).startswith(str(engine.docs_dir)):
+                return [types.TextContent(type="text", text="Access denied: path traversal detected.")]
+            
+            # 相対パスに戻して ACL チェック
+            rel_path = str(requested_path.relative_to(engine.docs_dir)).replace("\\", "/")
+        except Exception as e:
+            return [types.TextContent(type="text", text=f"Invalid path: {e}")]
+
         # パスの最初のディレクトリをroot_folderとしてACLチェック
         allowed = _get_allowed()
+        print(f"[DEBUG] get_document_content: rel_path={rel_path}, allowed={allowed}", file=sys.stderr)
         if allowed is not None:
             import pathlib
-            parts = pathlib.PurePosixPath(doc_path.replace("\\", "/")).parts
+            parts = pathlib.PurePosixPath(rel_path).parts
             doc_root = parts[0] if len(parts) > 0 else ""
             if doc_root not in allowed:
                 return [types.TextContent(type="text", text="Access denied: you do not have permission to access this document.")]
-        content = engine.get_document_text(doc_path)
-        return [types.TextContent(type="text", text=content if content else "Document not found in index.")]
+        
+        content = await asyncio.to_thread(_with_context(engine.get_document_text), rel_path)
+        res = [types.TextContent(type="text", text=content if content else "Document not found in index.")]
+        print(f"[DEBUG] handle_call_tool end: {name}, duration={time.time()-_start_time:.4f}s", file=sys.stderr)
+        return res
 
     elif name == "list_documents":
-        docs = engine.list_documents()
+        docs = await asyncio.to_thread(_with_context(engine.list_documents))
         allowed = _get_allowed()
         if allowed is not None:
             # パスの最初のディレクトリ部分が許可ルートのもののみ
@@ -429,10 +459,12 @@ async def main():
             _ctx_default.set(default_roots)
             _ctx_categories.set(default_categories)
 
-            # SSEのsendをインターセプトして session_id を session_registry に登録（デバッグ用）
+            # _with_context はモジュールレベルで定義済み
             original_send = request._send
+            current_sid = None
 
             async def intercepting_send(message):
+                nonlocal current_sid
                 if message.get("type") == "http.response.body":
                     body = message.get("body", b"")
                     if isinstance(body, bytes):
@@ -446,14 +478,20 @@ async def main():
                                 qs = parse_qs(parsed_url.query)
                                 sid = qs.get("session_id", [None])[0]
                                 if sid:
+                                    current_sid = sid
                                     _session_registry[sid] = {"allowed": allowed, "default_roots": default_roots, "default_categories": default_categories}
                                     print(f"Registered session {sid[:8]}... allowed={allowed}", file=sys.stderr)
                             except Exception as e:
                                 print(f"Session parse error: {e}", file=sys.stderr)
                 await original_send(message)
 
-            async with sse.connect_sse(request.scope, request.receive, intercepting_send) as (read_stream, write_stream):
-                await server.run(read_stream, write_stream, init_options)
+            try:
+                async with sse.connect_sse(request.scope, request.receive, intercepting_send) as (read_stream, write_stream):
+                    await server.run(read_stream, write_stream, init_options)
+            finally:
+                if current_sid and current_sid in _session_registry:
+                    del _session_registry[current_sid]
+                    print(f"Cleaned up session {current_sid[:8]}...", file=sys.stderr)
             return Response()
 
         app = Starlette(

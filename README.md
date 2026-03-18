@@ -17,7 +17,8 @@ PDF・Word・Excel・PowerPoint・画像・ソースコードなど多様なフ�
 | 機能 | 説明 |
 |------|------|
 | 文書変換 | PDF・DOCX・XLSX・PPTX・画像 → Markdown 変換（OCR対応） |
-| セマンティック検索 | Ollama 埋め込みモデルによるベクトル検索 |
+| ハイブリッド検索 | ベクトル検索 (Dense) と BM25 (Sparse) を組み合わせた高精度検索 |
+| リランキング | FlashRank による検索結果の再評価・最適化 |
 | アクセス制御 (ACL) | API キーによるルートフォルダ単位の検索権限管理 |
 | 差分同期 | 更新ファイルのみ再インデックス（mtime 管理） |
 | SSE / Stdio 両対応 | CLINE (SSE) や stdio MCP クライアントどちらでも利用可能 |
@@ -33,7 +34,10 @@ flowchart TD
     subgraph ServerSide["⚙️ サーバー側 (Local RAG MCP Server)"]
         Server["server.py<br/>MCPサーバー<br/>(SSE / stdio)"]
         RAG["rag_engine.py<br/>RAGエンジン"]
-        Chroma[("ChromaDB<br/>ベクトルDB")]
+        Chroma[("ChromaDB<br/>ベクトルDB<br/>(Dense検索)")]
+        BM25[("BM25インデックス<br/>(Sparse検索)")]
+        FlashRank["FlashRank<br/>リランキングモデル"]
+        ModelCache[("models/flashrank_cache/<br/>モデルキャッシュ")]
         Ollama_Embed["Ollama<br/>埋め込みモデル"]
         Converter["file_converter.py<br/>文書変換エンジン"]
         OCR_Ollama["Ollama<br/>glm-ocr (OCR)"]
@@ -45,12 +49,17 @@ flowchart TD
     Client <-->|"MCP Protocol<br/>(検索 / ツール実行 / 応答)"| Server
     Server <--> RAG
     RAG <--> Chroma
+    RAG <--> BM25
     RAG <--> Ollama_Embed
+    RAG <--> FlashRank
+    FlashRank <--> ModelCache
     RAG <--> Converter
     Converter <-->|"ocr_engine"| OCR_Ollama
     Converter <-->|"ocr_engine"| OCR_Paddle
     Docs --> RAG
     UpdateIdx -->|"差分 / フル再構築"| RAG
+    RAG -->|"ハイブリッド検索結果"| FlashRank
+    FlashRank -->|"リランキング済み結果"| Server
 ```
 
 
@@ -76,16 +85,100 @@ venv\Scripts\activate        # Windows
 
 # 3. 依存パッケージをインストール
 pip install -r requirements.txt
+```
 
-# 4. PaddleOCR用バックエンドのインストール (PaddleOCRを使用する場合のみ)
+### 2.1 OCRエンジンの選択
 
-デフォルトでは安定動作のため **CPU版** の利用を推奨しています。
+本システムは2種類のOCRエンジンをサポートしています：
+
+| OCRエンジン | 特徴 | インストール |
+|------------|------|-------------|
+| **Ollama glm-ocr**（デフォルト） | Ollamaサーバー経由でOCR実行。追加インストール不要。GPUはOllama側で管理。 | なし（Ollamaに`glm-ocr`モデルをプルするのみ） |
+| **PaddleOCR**（オプショナル） | ローカル実行のOCRライブラリ。Ollamaに依存せず動作可能。 | 別途インストール必要 |
+
+#### Ollama glm-ocrを使用する場合（デフォルト）
+
 ```bash
-pip install paddlepaddle
+# Ollamaにglm-ocrモデルをプル
+ollama pull glm-ocr:latest
+```
+
+`config.json`で以下のように設定：
+
+```json
+{
+  "ocr_engine": "ollama",
+  "ocr_model": "glm-ocr:latest"
+}
+```
+
+#### PaddleOCRを使用する場合（オプショナル）
+
+PaddleOCRはオプショナルな依存関係です。使用する場合は以下の手順でインストールしてください。
+
+**CPU版のインストール（推奨）**：
+```bash
+pip install paddlepaddle paddleocr
+```
+
+**GPU版のインストール（上級者向け）**：
+```bash
+pip install paddlepaddle-gpu paddleocr
 ```
 
 > [!WARNING]
 > GPU版の導入は特定のDLL (`cudnn64_8.dll`, `zlibwapi.dll`) の手動配置が求められるため**上級者向け**です。どうしてもGPU版を利用したい場合は、[PADDLE_GPU_SETUP.md](PADDLE_GPU_SETUP.md) の手順に従って個別にセットアップを行ってください。
+
+`config.json`で以下のように設定：
+
+```json
+{
+  "ocr_engine": "paddleocr",
+  "paddleocr_use_gpu": false
+}
+```
+
+> [!TIP]
+> PaddleOCRがインストールされていない状態で`ocr_engine: "paddleocr"`を設定した場合、自動的にOllama glm-ocrにフォールバックします。
+
+## オフライン環境へのインストール
+
+ネットワークに接続されていないUbuntu端末へのインストール方法を提供しています。
+
+### Dockerイメージ方式（推奨）
+
+Dockerイメージを使用して、環境を完全にパッケージングできます。
+
+```bash
+# Windows側（オンライン環境）
+.\scripts\export-docker-image.ps1 -IncludeModels
+
+# Ubuntu側（オフライン環境）
+./scripts/import-docker-image.sh
+docker-compose up -d
+```
+
+### 自己完結型パッケージ方式
+
+Python環境が不要なスタンドアロンバイナリを生成できます。
+
+```bash
+# ビルド
+python build-standalone.py --clean
+```
+
+詳細な手順は [docs/OFFLINE_INSTALL.md](docs/OFFLINE_INSTALL.md) を参照してください。
+
+### Docker環境でのユーティリティ実行
+
+Docker環境では、以下のコマンドでユーティリティを実行できます：
+
+```bash
+# インデックスの手動更新
+docker-compose exec mcp-server python update_index.py
+
+# サーバーの停止（通常は docker-compose stop を使用）
+docker-compose exec mcp-server python stop.py
 ```
 
 ## 3. 初期設定
@@ -95,6 +188,7 @@ pip install paddlepaddle
 `config.json` を自分の環境に合わせて編集してください。
 
 ```json
+{
   "source_docs_dir": "C:\\path\\to\\your\\documents",
   "docs_dir": "converted_docs",
   "embedding_model": "nomic-embed-text-v2-moe:latest",
@@ -104,7 +198,14 @@ pip install paddlepaddle
   "paddleocr_use_gpu": false,
   "ollama_base_url": "http://localhost:11434",
   "db_dir": "./chroma_db",
-  "collection_name": "mcp_rag_collection"
+  "collection_name": "mcp_rag_collection",
+  "search_settings": {
+    "hybrid_search_enabled": true,
+    "reranking_enabled": true,
+    "flashrank_model": "ms-marco-MultiBERT-L-12",
+    "flashrank_cache_dir": "models/flashrank_cache",
+    "flashrank_offline_mode": false
+  }
 }
 ```
 
@@ -120,6 +221,48 @@ pip install paddlepaddle
 | `ollama_base_url` | Ollama の API エンドポイント |
 | `db_dir` | ChromaDB の保存先（相対パス） |
 | `collection_name` | ChromaDB コレクション名 |
+| `search_settings` | 検索エンジンに関する詳細設定（以下参照） |
+
+### search_settings の詳細
+
+| パラメータ | 説明 |
+|------------|------|
+| `hybrid_search_enabled` | ハイブリッド検索（ベクトル検索 + BM25）を有効にするか (`true`/`false`) |
+| `reranking_enabled` | FlashRank によるリランキングを有効にするか (`true`/`false`) |
+| `flashrank_model` | 使用する FlashRank モデル名 |
+| `flashrank_cache_dir` | FlashRank モデルの保存先ディレクトリ |
+| `flashrank_offline_mode` | オフラインモードを有効にするか (`true`/`false`) |
+
+#### FlashRank オフライン運用について
+
+インターネット接続がない環境でリランキング機能を使用する場合は、以下の手順でセットアップを行ってください。
+
+**推奨モデル:**
+- デフォルト: `ms-marco-MultiBERT-L-12`（軽量・高速）
+
+**フォルダ構成:**
+```
+models/
+└── flashrank_cache/
+    └── ms-marco-MultiBERT-L-12/
+        ├── tokenizer.json
+        ├── tokenizer_config.json
+        ├── special_tokens_map.json
+        └── *.onnx (モデルファイル)
+```
+
+**オフラインモードの設定手順:**
+
+1. **モデルのダウンロード（オンライン環境で実行）**
+   - インターネット接続のある環境でサーバーを起動し、初回の検索を実行すると自動的にモデルがダウンロードされます
+   - または、手動でモデルファイルを上記フォルダ構成で配置します
+
+2. **オフラインモードの有効化**
+   - `config.json` で `flashrank_offline_mode: true` を設定します
+   - これにより、インターネット接続を試みずにローカルのモデルファイルを使用します
+
+3. **動作確認**
+   - オフライン環境でサーバーを起動し、検索が正常に動作することを確認してください
 
 ### ドキュメントフォルダの構成
 
@@ -229,12 +372,12 @@ After=network.target
 [Service]
 Type=simple
 User=your-username
-WorkingDirectory=/home/your-username/local-rag-mcp-servr
-ExecStart=/home/your-username/local-rag-mcp-servr/venv/bin/python server.py --transport sse --port 8000
+WorkingDirectory=/home/your-username/local-rag-mcp-server
+ExecStart=/home/your-username/local-rag-mcp-server/venv/bin/python server.py --transport sse --port 8000
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/home/your-username/local-rag-mcp-servr/server.log
-StandardError=append:/home/your-username/local-rag-mcp-servr/server.log
+StandardOutput=append:/home/your-username/local-rag-mcp-server/server.log
+StandardError=append:/home/your-username/local-rag-mcp-server/server.log
 
 [Install]
 WantedBy=multi-user.target
@@ -453,11 +596,11 @@ python _cleanup_db.py
 アクセス権を持つ共有フォルダ（ルートフォルダ）に、ファイルをコピーまたは保存するだけです。
 
 > **反映タイミング**: ファイルを追加しても検索に即時反映されません。次回の自動インデックス更新後（深夜バッチ等）に反映されます。すぐに反映させたい場合は CLINE のチャット欄に以下のように入力してください。
->
+
 > ```
 > ドキュメントのインデックスを今すぐ更新してください。
 > ```
->
+
 > CLINE が自動的に `update_index` ツールを呼び出し、バックグラウンドで更新を開始します。進捗を確認したい場合は `インデックスの更新状況を教えてください。` と入力してください。
 
 #### アクセス権について
@@ -552,6 +695,8 @@ A. 画像として作成された PDF（スキャンした文書など）は OCR
 
 **Q. CLINE にサーバーの URL や API キーをどう設定すればいいか**  
 A. 管理者から提供された URL・API キーを CLINE の MCP サーバー設定に入力してください。設定方法は「[CLINE への接続設定](#cline-への接続設定)」を参照してください。
+
+---
 
 ---
 
