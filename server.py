@@ -360,8 +360,8 @@ async def handle_call_tool(
                 sync_state["progress"] = "開始準備中..."
                 sync_state["last_result"] = None
 
-        allowed = _get_allowed()
-        t = threading.Thread(target=_run_sync_background, args=(force_flag, allowed), daemon=True)
+        # インデックス更新は管理操作のため、ACL制限を適用せず全ドキュメントを対象とする
+        t = threading.Thread(target=_run_sync_background, args=(force_flag, None), daemon=True)
         t.start()
         return [types.TextContent(type="text", text=(
             "インデックスの同期をバックグラウンドで開始しました。\n"
