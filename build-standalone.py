@@ -76,45 +76,30 @@ PACKAGES_TO_INCLUDE = [
     "rank_bm25",
     "flashrank",
     
-    # Document processing
-    "fitz",  # PyMuPDF
+    # Document processing - only include what's installed
     "PIL",
-    "PIL.Image",
     "openpyxl",
     "docx",
     "pptx",
     
     # Utilities
     "watchdog",
-    "watchdog.observers",
-    "watchdog.events",
     "psutil",
     "urllib3",
     "charset_normalizer",
     
     # Additional dependencies for ChromaDB
     "sqlite3",
-    "sqlite",
     
     # ONNX Runtime (for flashrank)
     "onnxruntime",
     
     # Additional packages that may be dynamically loaded
     "httpx",
-    "httpcore",
-    "h11",
-    "anyio",
-    "sniffio",
     "tenacity",
-    "overrides",
-    "typing_extensions",
     "pydantic",
-    "pydantic_core",
-    "annotated_types",
     "tqdm",
     "numpy",
-    "pypdf",
-    "pypdfium2",
 ]
 
 # Packages that need recursive inclusion
@@ -125,6 +110,8 @@ PACKAGES_RECURSIVE = [
     "chromadb",
     "flashrank",
     "onnxruntime",
+    "anyio",
+    "httpcore",
 ]
 
 
@@ -177,13 +164,13 @@ def build_nuitka_command(
         cmd.append("--onefile")
     
     if output_dir:
-        cmd.extend(["--output-dir", str(output_dir)])
+        cmd.append(f"--output-dir={output_dir}")
     else:
         output_dir = project_root / "dist"
-        cmd.extend(["--output-dir", str(output_dir)])
+        cmd.append(f"--output-dir={output_dir}")
     
     # Output filename
-    cmd.extend(["--output-filename", PROJECT_NAME])
+    cmd.append(f"--output-filename={PROJECT_NAME}")
     
     # Python flags
     cmd.append("--python-flag=no_site")
@@ -192,53 +179,38 @@ def build_nuitka_command(
     cmd.append("--assume-yes-for-downloads")
     
     # Enable plugins for better compatibility
-    cmd.extend([
-        "--enable-plugin=pylint-warnings",
-    ])
+    cmd.append("--enable-plugin=pylint-warnings")
     
     # Include packages
     for package in PACKAGES_TO_INCLUDE:
         if package in PACKAGES_RECURSIVE:
-            cmd.extend(["--include-package", package])
+            cmd.append(f"--include-package={package}")
         else:
-            cmd.extend(["--include-module", package])
+            cmd.append(f"--include-module={package}")
     
     # Include data files
     for data_file in DATA_FILES:
         source_path = project_root / data_file
         if source_path.exists():
             # Format: source=destination
-            cmd.extend([
-                "--include-data-file",
-                f"{source_path}={data_file}"
-            ])
+            cmd.append(f"--include-data-file={source_path}={data_file}")
     
     # Include source Python files
     for source_file in SOURCE_FILES:
         source_path = project_root / source_file
         if source_path.exists() and source_file != MAIN_SCRIPT:
             # Include as data file for import
-            cmd.extend([
-                "--include-data-file",
-                f"{source_path}={source_file}"
-            ])
+            cmd.append(f"--include-data-file={source_path}={source_file}")
     
     # Platform-specific options
     if platform == "linux":
-        cmd.extend([
-            "--linux-icon=none",  # No icon for now
-        ])
+        pass  # No special options for Linux
     elif platform == "windows":
-        cmd.extend([
-            "--windows-icon-from-ico=none",  # No icon for now
-            "--windows-console-mode=force",  # Force console for debugging
-        ])
+        cmd.append("--windows-console-mode=force")
     
     # Optimization flags
-    cmd.extend([
-        "--lto=yes",  # Link-time optimization
-        "--assume-yes-for-downloads",
-    ])
+    cmd.append("--lto=yes")
+    cmd.append("--assume-yes-for-downloads")
     
     # Add main script
     cmd.append(str(project_root / MAIN_SCRIPT))

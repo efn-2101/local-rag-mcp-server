@@ -17,7 +17,7 @@ charset-normalizer>=3.0.0
 # rank_bm25 for in-memory fast keyword search (BM25 algorithm)
 rank_bm25>=0.2.2
 # flashrank for ultra-lightweight re-ranking based on ONNX runtime
-flashrank>=0.2.12
+flashrank>=0.2.10
 
 # --- OCR Dependencies (Optional) ---
 # By default, Ollama OCR is used (requires Ollama server with glm-ocr model).
