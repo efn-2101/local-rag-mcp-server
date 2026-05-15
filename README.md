@@ -20,7 +20,8 @@ PDF・Word・Excel・PowerPoint・画像・ソースコードなど多様なフ�
 | ハイブリッド検索 | ベクトル検索 (Dense) と BM25 (Sparse) を組み合わせた高精度検索 |
 | リランキング | FlashRank による検索結果の再評価・最適化 |
 | アクセス制御 (ACL) | API キーによるルートフォルダ単位の検索権限管理 |
-| 差分同期 | 更新ファイルのみ再インデックス（mtime 管理） |
+| 差分同期 | 更新ファイルのみ再インデックス（mtime + 内容ハッシュ管理） |
+| ハッシュベースOCRスキップ | 内容が変わっていないファイルのOCR処理をスキップ |
 | コンテキスト制限 | 巨大ドキュメント（1MB超）の自動圧縮・LLMコンテキスト上限を超えない制御 |
 | SSE / Stdio 両対応 | CLINE (SSE) や stdio MCP クライアントどちらでも利用可能 |
 
@@ -778,6 +779,7 @@ local-rag-mcp-servr/
 ├── file_converter.py  # 文書変換エンジン（PDF OCR 等）
 ├── file_watcher.py    # ファイル変更監視（watchdog）
 ├── update_index.py    # インデックス手動更新ツール
+├── _generate_source_hashes.py  # 既存環境向けハッシュ生成ツール（OCRスキップ用）
 ├── stop.py            # サーバー停止ツール
 ├── _cleanup_db.py     # DB メンテナンスツール（バックスラッシュパス削除）
 ├── config.json        # 設定ファイル
