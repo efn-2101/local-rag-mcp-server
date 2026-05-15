@@ -21,6 +21,7 @@ PDF・Word・Excel・PowerPoint・画像・ソースコードなど多様なフ�
 | リランキング | FlashRank による検索結果の再評価・最適化 |
 | アクセス制御 (ACL) | API キーによるルートフォルダ単位の検索権限管理 |
 | 差分同期 | 更新ファイルのみ再インデックス（mtime 管理） |
+| コンテキスト制限 | 巨大ドキュメント（1MB超）の自動圧縮・LLMコンテキスト上限を超えない制御 |
 | SSE / Stdio 両対応 | CLINE (SSE) や stdio MCP クライアントどちらでも利用可能 |
 
 ## アーキテクチャ概要
@@ -205,6 +206,14 @@ docker-compose exec mcp-server python stop.py
     "flashrank_model": "ms-marco-MultiBERT-L-12",
     "flashrank_cache_dir": "models/flashrank_cache",
     "flashrank_offline_mode": false
+  },
+  "context_management": {
+    "detail_level": "auto",
+    "max_context_tokens": 128000,
+    "max_document_tokens": 12000,
+    "max_search_result_tokens": 8000,
+    "summary_model": null,
+    "ollama_base_url": null
   }
 }
 ```
@@ -222,6 +231,7 @@ docker-compose exec mcp-server python stop.py
 | `db_dir` | ChromaDB の保存先（相対パス） |
 | `collection_name` | ChromaDB コレクション名 |
 | `search_settings` | 検索エンジンに関する詳細設定（以下参照） |
+| `context_management` | 巨大ドキュメントのコンテキスト制限設定（以下参照） |
 
 ### search_settings の詳細
 
@@ -232,6 +242,30 @@ docker-compose exec mcp-server python stop.py
 | `flashrank_model` | 使用する FlashRank モデル名 |
 | `flashrank_cache_dir` | FlashRank モデルの保存先ディレクトリ |
 | `flashrank_offline_mode` | オフラインモードを有効にするか (`true`/`false`) |
+
+### context_management の詳細
+
+| パラメータ | 説明 |
+|------------|------|
+| `detail_level` | ドキュメント詳細度: `"auto"`（デフォルト、上限超過時のみ圧縮） / `"summary"`（常に圧縮） / `"full"`（常に全文） |
+| `max_context_tokens` | LLMのコンテキスト上限トークン数（デフォルト: 128000） |
+| `max_document_tokens` | `get_document_content` の最大返却トークン数（デフォルト: 12000） |
+| `max_search_result_tokens` | `search_documents` の最大返却トークン数（デフォルト: 8000） |
+| `summary_model` | LLM要約用のOllamaモデル名（オプション。`null` の場合は構造ベース圧縮のみ使用） |
+| `ollama_base_url` | 要約専用の別OllamaサーバーURL（オプション。`null` の場合はデフォルトの `ollama_base_url` を使用） |
+
+#### 巨大ドキュメント（1MB超）の扱いについて
+
+本サーバーは **1MB超の単一Markdownファイル** など、巨大ドキュメントに対して自動的にコンテキスト制限を適用します。
+
+**仕組み:**
+1. `get_document_content` や `search_documents` の返却時に、トークン数を自動カウント
+2. 設定された上限（`max_document_tokens` / `max_search_result_tokens`）を超える場合、Markdownの見出し構造を尊重して段階的に圧縮
+3. 圧縮時は「先頭文 + 重要キーワード文 + 末尾文」を残し、省略部分は `get_document_content(path=..., section=...)` で詳細取得可能と明示
+
+**後方互換性:**
+- `config.json` に `context_management` が未設定の場合、`detail_level: "auto"` で動作（上限内なら全文返却、超過時のみ圧縮）
+- 通常サイズのドキュメント（数KB〜数百KB）は従来通り全文返却
 
 #### FlashRank オフライン運用について
 
@@ -706,10 +740,10 @@ A. 管理者から提供された URL・API キーを CLINE の MCP サーバー
 
 | ツール名 | 説明 |
 |---------|------|
-| `search_documents` | 自然言語クエリでドキュメントを検索 |
+| `search_documents` | 自然言語クエリでドキュメントを検索（結果は自動的にコンテキスト制限が適用） |
 | `list_roots` | アクセス可能なルートフォルダ一覧 |
 | `list_categories` | アクセス可能なカテゴリ（サブフォルダ）一覧 |
-| `get_document_content` | 指定パスのドキュメント全文取得 |
+| `get_document_content` | 指定パスのドキュメント取得（巨大ドキュメントは自動圧縮、`section` で特定セクション詳細取得可） |
 | `list_documents` | インデックス済みドキュメント一覧 |
 | `update_index` | インデックスをバックグラウンドで更新 |
 | `get_sync_status` | インデックス更新の進捗確認 |
@@ -723,12 +757,24 @@ A. 管理者から提供された URL・API キーを CLINE の MCP サーバー
 | `category` | string | 絞り込むカテゴリ名（省略可） |
 | `n_results` | integer | 取得件数（デフォルト: 5） |
 
+### get_document_content パラメータ
+
+| パラメータ | 型 | 説明 |
+|-----------|---|------|
+| `path` | string | ドキュメントの相対パス（必須） |
+| `section` | string | 取得するセクションの見出し名（省略可。指定すると該当セクションのみ全文取得） |
+
+> **セクション指定の例**: `get_document_content(path="manual.md", section="1. インストール手順")`
+>
+> 巨大ドキュメントで特定の章だけ詳しく読みたい場合に使用します。セクション名が見つからない場合は、利用可能なセクション一覧が返されます。
+
 ## ファイル構成
 
 ```
 local-rag-mcp-servr/
 ├── server.py          # MCP サーバー本体（SSE / stdio）
 ├── rag_engine.py      # RAG エンジン（ChromaDB / Ollama）
+├── context_budget.py  # コンテキスト予算管理（巨大ドキュメント圧縮・トークン制限）
 ├── file_converter.py  # 文書変換エンジン（PDF OCR 等）
 ├── file_watcher.py    # ファイル変更監視（watchdog）
 ├── update_index.py    # インデックス手動更新ツール

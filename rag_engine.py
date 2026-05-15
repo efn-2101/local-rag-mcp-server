@@ -1,17 +1,66 @@
 import os
 os.environ["CHROMA_TELEMETRY"] = "FALSE"
+os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 # 以下の設定で Rust バックエンドでの SQLite 不具合やアクセス違反を回避（もし動作するなら）
 # os.environ["CHROMA_RUST_BINDINGS"] = "FALSE"
 import json
 import sys
 import glob
+import re
+import hashlib
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import ollama
 import chromadb
 from rank_bm25 import BM25Okapi
 from flashrank import Ranker, RerankRequest
+
+# コンテキスト予算管理モジュール
+from context_budget import (
+    ContextBudget,
+    count_tokens,
+    parse_markdown_sections,
+    extract_section_by_heading,
+    compress_document_structure,
+    fit_search_results_to_budget,
+    truncate_to_tokens,
+)
+
+
+def _normalize_path(path_str: str) -> str:
+    """
+    パス文字列を正規化する。
+    - バックスラッシュ → フォワードスラッシュ
+    - 全角空白(U+3000)、タブ(U+0009)、ノーブレークスペース(U+00A0) 等の空白類文字 → 半角空白(U+0020)
+    - 連続する半角空白を1つに圧縮
+    """
+    # バックスラッシュ → フォワードスラッシュ
+    normalized = path_str.replace("\\", "/")
+    # 各種空白類文字を半角空白に統一
+    # U+3000 全角空白, U+00A0 ノーブレークスペース, U+0009 タブ, U+2000-U+200A 一般空白類
+    normalized = normalized.replace("\u3000", " ")
+    normalized = normalized.replace("\u00a0", " ")
+    normalized = normalized.replace("\t", " ")
+    normalized = re.sub(r"[\u2000-\u200a]", " ", normalized)
+    # 連続する半角空白を1つに圧縮
+    normalized = re.sub(r" {2,}", " ", normalized)
+    # パス先頭・末尾の空白を除去
+    normalized = normalized.strip(" ")
+    return normalized
+
+
+def _compute_file_hash(file_path: Path) -> str:
+    """ファイル内容のSHA-256ハッシュを計算する"""
+    sha256 = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+    except Exception as e:
+        print(f"Error computing hash for {file_path}: {e}", file=sys.stderr)
+        return ""
 
 
 class RagEngine:
@@ -72,6 +121,28 @@ class RagEngine:
         self.retrieval_limit_per_method = search_settings.get("retrieval_limit_per_method", 20)
         self.rerank_top_k = search_settings.get("rerank_top_k", 5)
         
+        # Context management settings (for large document handling)
+        ctx_mgmt = self.config.get("context_management", {})
+        self.detail_level = ctx_mgmt.get("detail_level", "auto")  # "auto" | "summary" | "full"
+        self.max_context_tokens = ctx_mgmt.get("max_context_tokens", 128000)
+        self.max_document_tokens = ctx_mgmt.get("max_document_tokens", 12000)
+        self.max_search_result_tokens = ctx_mgmt.get("max_search_result_tokens", 8000)
+        self.summary_model = ctx_mgmt.get("summary_model", None)  # None = use default ollama model
+        self.summary_ollama_url = ctx_mgmt.get("ollama_base_url", None)  # None = use default
+        
+        # Initialize context budget calculator
+        self.context_budget = ContextBudget(
+            max_context_tokens=self.max_context_tokens,
+        )
+        
+        # Optional: separate Ollama client for summarization
+        self.summary_ollama_client = None
+        if self.summary_ollama_url and self.summary_ollama_url != self.config["ollama_base_url"]:
+            try:
+                self.summary_ollama_client = ollama.Client(host=self.summary_ollama_url)
+            except Exception as e:
+                print(f"Warning: Failed to initialize summary Ollama client: {e}", file=sys.stderr)
+        
         # BM25 index attributes (will be initialized in sync_documents)
         self.bm25_index: Optional[BM25Okapi] = None
         self.bm25_texts: List[str] = []
@@ -113,8 +184,31 @@ class RagEngine:
         # Initialize FlashRank ranker safely
         self._init_flashrank_ranker(base_dir)
         
+        # Source file hash tracking for avoiding redundant OCR
+        self.source_hashes_path = db_path.parent / ".source_hashes.json"
+        self.source_hashes: Dict[str, str] = {}
+        self._load_source_hashes()
+        
         # Initialize BM25 index from existing documents
         self._init_bm25_index()
+
+    def _load_source_hashes(self):
+        """元ファイルのハッシュ状態を読み込む"""
+        if self.source_hashes_path.exists():
+            try:
+                with open(self.source_hashes_path, "r", encoding="utf-8") as f:
+                    self.source_hashes = json.load(f)
+            except Exception as e:
+                print(f"Error loading source hashes: {e}", file=sys.stderr)
+                self.source_hashes = {}
+
+    def _save_source_hashes(self):
+        """元ファイルのハッシュ状態を保存する"""
+        try:
+            with open(self.source_hashes_path, "w", encoding="utf-8") as f:
+                json.dump(self.source_hashes, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error saving source hashes: {e}", file=sys.stderr)
 
     def _init_flashrank_ranker(self, base_dir: Path):
         """FlashRank Ranker を安全に初期化（オフライン水際防御）"""
@@ -147,10 +241,74 @@ class RagEngine:
             print(f"FlashRank initialization failed: {e}", file=sys.stderr)
             self.ranker = None
 
+    def _safe_collection_get(self, include=None, where=None):
+        """
+        ChromaDB Rust バックエンドのバグと SQLite バインド変数制限を回避する
+        安全な collection.get() ラッパー。
+        
+        - 空コレクション時は即座に空結果を返す
+        - limit/offset で分割取得し、大規模コレクションでも安全
+        """
+        BATCH_SIZE = 5000  # SQLite 32,767 制限の余裕を持たせる
+        
+        # 空コレクション回避: count() は軽量
+        try:
+            total = self.collection.count()
+        except Exception as e:
+            print(f"Error in collection.count(): {e}", file=sys.stderr)
+            return {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+        
+        if total == 0:
+            return {"ids": [], "documents": [], "metadatas": [], "embeddings": []}
+        
+        # where 付きの場合、対象件数が少ない可能性があるが、安全のため分割取得
+        all_ids = []
+        all_documents = [] if include and "documents" in include else None
+        all_metadatas = [] if include and "metadatas" in include else None
+        all_embeddings = [] if include and "embeddings" in include else None
+        
+        offset = 0
+        while True:
+            try:
+                batch = self.collection.get(
+                    where=where,
+                    include=include,
+                    limit=BATCH_SIZE,
+                    offset=offset
+                )
+            except Exception as e:
+                print(f"Error in collection.get() batch offset={offset}: {e}", file=sys.stderr)
+                raise
+            
+            if not batch or not batch.get("ids"):
+                break
+                
+            all_ids.extend(batch["ids"])
+            if all_documents is not None:
+                all_documents.extend(batch.get("documents", []))
+            if all_metadatas is not None:
+                all_metadatas.extend(batch.get("metadatas", []))
+            if all_embeddings is not None:
+                all_embeddings.extend(batch.get("embeddings", []))
+            
+            if len(batch["ids"]) < BATCH_SIZE:
+                break
+            offset += BATCH_SIZE
+        
+        result = {"ids": all_ids}
+        if all_documents is not None:
+            result["documents"] = all_documents
+        if all_metadatas is not None:
+            result["metadatas"] = all_metadatas
+        if all_embeddings is not None:
+            result["embeddings"] = all_embeddings
+        
+        return result
+
     def _init_bm25_index(self):
         """既存のドキュメントから BM25 インデックスを初期化"""
         try:
-            result = self.collection.get(include=["documents"])
+            result = self._safe_collection_get(include=["documents"])
             if result and result["documents"]:
                 self.bm25_texts = result["documents"]
                 if self.bm25_texts:
@@ -173,7 +331,7 @@ class RagEngine:
     def _build_bm25_corpus(self):
         """ChromaDB のドキュメントから BM25 コーパスを再構築"""
         try:
-            result = self.collection.get(include=["documents"])
+            result = self._safe_collection_get(include=["documents"])
             if result and result["documents"]:
                 self.bm25_texts = result["documents"]
                 if self.bm25_texts:
@@ -248,10 +406,10 @@ class RagEngine:
             return
 
         category = file_path.parent.name if file_path.parent != self.docs_dir else "default"
-        # Windows バックスラッシュの chromaDB where フィルター不具合を回避するため、常にフォワードスラッシュに正規化
-        rel_path = str(file_path.relative_to(self.docs_dir)).replace("\\", "/")
+        # パスを正規化（バックスラッシュ→スラッシュ、全角空白→半角空白、連続空白圧縮）
+        rel_path = _normalize_path(str(file_path.relative_to(self.docs_dir)))
         rel_parts = file_path.relative_to(self.docs_dir).parts
-        root_folder = rel_parts[0] if len(rel_parts) > 0 else "default"
+        root_folder = _normalize_path(rel_parts[0]) if len(rel_parts) > 0 else "default"
         
         # Get file modified time
         mtime = os.path.getmtime(file_path)
@@ -265,6 +423,9 @@ class RagEngine:
         
         if not content.strip():
             return
+
+        # Compute content hash for change detection
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
         # Delete existing chunks for this file first
         self.delete_document(file_path)
@@ -282,7 +443,7 @@ class RagEngine:
                 self.collection.upsert(
                     ids=[chunk_id],
                     embeddings=[embedding],
-                    metadatas=[{"root_folder": root_folder, "category": category, "path": rel_path, "chunk_index": i, "overlap": self.config.get("chunk_overlap", 100), "mtime": mtime}],
+                    metadatas=[{"root_folder": root_folder, "category": category, "path": rel_path, "chunk_index": i, "overlap": self.config.get("chunk_overlap", 100), "mtime": mtime, "content_hash": content_hash}],
                     documents=[chunk]
                 )
             except Exception as e:
@@ -291,21 +452,45 @@ class RagEngine:
                 if hasattr(e, "response"):
                      print(f"Response: {e.response.text if hasattr(e.response, 'text') else e.response}", file=sys.stderr)
         
+    def has_document_changed(self, file_path: Path) -> bool:
+        """
+        ファイル内容がDBに保存されているものと異なるかをチェック。
+        ハッシュベースで判定し、ハッシュがない場合はmtimeフォールバック。
+        """
+        if not file_path.is_file():
+            return True
+        
+        rel_path = _normalize_path(str(file_path.relative_to(self.docs_dir)))
+        
+        try:
+            result = self._safe_collection_get(where={"path": rel_path}, include=["metadatas"])
+            if result and result["metadatas"]:
+                db_hash = result["metadatas"][0].get("content_hash", "")
+                if db_hash:
+                    current_hash = _compute_file_hash(file_path)
+                    return current_hash != db_hash
+                # Fallback to mtime for backward compatibility
+                db_mtime = result["metadatas"][0].get("mtime", 0.0)
+                file_mtime = os.path.getmtime(file_path)
+                return file_mtime > db_mtime + 1.0
+        except Exception as e:
+            print(f"Error checking document change for {rel_path}: {e}", file=sys.stderr)
+        
+        return True
+
     def delete_document(self, file_path: Path):
         """ファイルをインデックスから削除する"""
-        # フォワードスラッシュに正規化（chromaDB where フィルターが Windows バックスラッシュで失敗するため）
-        rel_path_fwd = str(file_path.relative_to(self.docs_dir)).replace("\\", "/")
-        rel_path_bak = rel_path_fwd.replace("/", "\\")  # 旧データ（バックスラッシュ保存）も削除できるようフォールバック
+        # パスを正規化（バックスラッシュ→スラッシュ、全角空白→半角空白、連続空白圧縮）
+        rel_path = _normalize_path(str(file_path.relative_to(self.docs_dir)))
 
-        for rel_path in [rel_path_fwd, rel_path_bak]:
-            try:
-                # where 句での delete が Rust バックエンドでクラッシュするため、get してから id 指定で削除する
-                results = self.collection.get(where={"path": rel_path}, include=[])
-                if results and results["ids"]:
-                    self.collection.delete(ids=results["ids"])
-                    print(f"Deleted from index: {rel_path} ({len(results['ids'])} chunks)", file=sys.stderr)
-            except Exception as e:
-                print(f"Error deleting {rel_path}: {e}", file=sys.stderr)
+        try:
+            # where 句での delete が Rust バックエンドでクラッシュするため、get してから id 指定で削除する
+            results = self.collection.get(where={"path": rel_path}, include=[])
+            if results and results["ids"]:
+                self.collection.delete(ids=results["ids"])
+                print(f"Deleted from index: {rel_path} ({len(results['ids'])} chunks)", file=sys.stderr)
+        except Exception as e:
+            print(f"Error deleting {rel_path}: {e}", file=sys.stderr)
         
     def _rrf_fusion(self, dense_results: List[Dict[str, Any]], sparse_results: List[Dict[str, Any]], k: int = 60) -> List[Dict[str, Any]]:
         """
@@ -380,7 +565,7 @@ class RagEngine:
         bm25_scores = self.bm25_index.get_scores(tokenized_query)
         
         # Get all IDs to map back
-        all_data = self.collection.get(include=["documents", "metadatas"])
+        all_data = self._safe_collection_get(include=["documents", "metadatas"])
         all_ids = all_data["ids"]
         all_docs = all_data["documents"]
         all_metas = all_data["metadatas"]
@@ -509,6 +694,62 @@ class RagEngine:
         
         print(f"[DEBUG] search: returning {len(output)} results", file=sys.stderr)
         return output
+    
+    def search_with_budget(
+        self,
+        query: str,
+        root_folder: Optional[str] = None,
+        category: Optional[str] = None,
+        n_results: int = 5,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        検索結果をトークン予算内に収めて返却する。
+        
+        Args:
+            query: 検索クエリ
+            root_folder: ルートフォルダフィルタ
+            category: カテゴリフィルタ
+            n_results: 結果件数
+            max_tokens: 検索結果の最大トークン数（Noneの場合はconfigの値を使用）
+        
+        Returns:
+            {
+                "text": フォーマット済みテキスト,
+                "truncated": 切り詰められたか,
+                "omitted_ids": 省略された結果IDリスト,
+                "result_count": 表示された結果件数,
+                "total_results": 全結果件数,
+            }
+        """
+        # 通常の検索を実行
+        results = self.search(query, root_folder, category, n_results)
+        
+        if not results:
+            return {
+                "text": "No relevant documents found.",
+                "truncated": False,
+                "omitted_ids": [],
+                "result_count": 0,
+                "total_results": 0,
+            }
+        
+        effective_max_tokens = max_tokens or self.max_search_result_tokens
+        
+        # 検索結果を予算内に収める
+        formatted_text, truncated, omitted_ids = fit_search_results_to_budget(
+            results,
+            budget_tokens=effective_max_tokens,
+            format_template="--- Result (Root: {root}, Category: {category}, Path: {path}) ---\n{content}\n",
+        )
+        
+        return {
+            "text": formatted_text,
+            "truncated": truncated,
+            "omitted_ids": omitted_ids,
+            "result_count": len(results) - len(omitted_ids),
+            "total_results": len(results),
+        }
 
     def get_roots(self) -> List[str]:
         # ChromaDB からユニークなカテゴリを取得するのは少しトリッキーなので、
@@ -522,7 +763,7 @@ class RagEngine:
         allowed_roots が指定されている場合は、そのルートフォルダに属するカテゴリのみを返す。
         """
         try:
-            result = self.collection.get(include=["metadatas"])
+            result = self._safe_collection_get(include=["metadatas"])
             if not result or not result["metadatas"]:
                 return []
             
@@ -547,7 +788,7 @@ class RagEngine:
         """インデックスされている全ドキュメントのパスを取得する"""
         try:
             # メタデータのみ取得して path を抽出
-            result = self.collection.get(include=["metadatas"])
+            result = self._safe_collection_get(include=["metadatas"])
             if not result or not result["metadatas"]:
                 return []
             
@@ -561,52 +802,144 @@ class RagEngine:
             print(f"Error listing documents: {e}", file=sys.stderr)
             return []
 
-    def get_document_text(self, doc_path: str) -> Optional[str]:
-        """指定されたパス（メタデータ path）のドキュメントのテキストを取得する (全チャンク結合)"""
-        print(f"[DEBUG] get_document_text: doc_path={doc_path}", file=sys.stderr)
+    def get_document_text(
+        self,
+        doc_path: str,
+        section: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        detail_level: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        指定されたパス（メタデータ path）のドキュメントのテキストを取得する。
+        
+        Args:
+            doc_path: ドキュメントのパス
+            section: 特定のセクション名（見出し）を指定して抽出
+            max_tokens: 返却する最大トークン数（Noneの場合はconfigの値を使用）
+            detail_level: "auto" | "summary" | "full"（Noneの場合はconfigの値を使用）
+        
+        Returns:
+            ドキュメントのテキスト（制限・圧縮適用済み）
+        """
+        # パスを正規化（検索時に全角空白等が混在しても一致するように）
+        normalized_path = _normalize_path(doc_path)
+        print(f"[DEBUG] get_document_text: doc_path={doc_path}, normalized={normalized_path}, section={section}", file=sys.stderr)
+        
         try:
             # メタデータで検索
-            result = self.collection.get(where={"path": doc_path}, include=["documents", "metadatas"])
+            result = self._safe_collection_get(where={"path": normalized_path}, include=["documents", "metadatas"])
             
-            if result and result["documents"] and len(result["documents"]) > 0:
-                print(f"[DEBUG] get_document_text: found {len(result['documents'])} chunks", file=sys.stderr)
-                # チャンクを index 順に並べ替え
-                chunks_with_index = []
-                for i in range(len(result["documents"])):
-                    meta = result["metadatas"][i]
-                    index = meta.get("chunk_index", 0) if meta else 0
-                    overlap = meta.get("overlap", 100) if meta else 100
-                    chunks_with_index.append((index, result["documents"][i], overlap))
-                
-                chunks_with_index.sort(key=lambda x: x[0])
-                
-                # 結合 (チャンク間の重複部分を考慮して結合)
-                full_text = ""
-                for i, (index, content, overlap) in enumerate(chunks_with_index):
-                    print(f"[DEBUG] get_document_text: processing chunk {index}, len={len(content)}, overlap={overlap}", file=sys.stderr)
-                    if i == 0:
-                        full_text = content
-                    else:
-                        # 前のチャンクとの重複部分を探す
-                        # overlap は目安なので、実際の重複を末尾から探す
-                        # 日本語の文字化けを防ぐため、単純なスライスではなく、
-                        # 前のテキストの末尾と現在のチャンクの先頭が一致する最大長を探す
-                        max_overlap = min(len(full_text), len(content), overlap + 50) # 少し余裕を持たせる
-                        actual_overlap = 0
-                        for j in range(max_overlap, 0, -1):
-                            if full_text.endswith(content[:j]):
-                                actual_overlap = j
-                                break
-                        
-                        full_text += content[actual_overlap:]
-                
-                print(f"[DEBUG] get_document_text: total length={len(full_text)}", file=sys.stderr)
+            if not result or not result["documents"] or len(result["documents"]) == 0:
+                print(f"[DEBUG] get_document_text: no chunks found for {doc_path}", file=sys.stderr)
+                return None
+            
+            print(f"[DEBUG] get_document_text: found {len(result['documents'])} chunks", file=sys.stderr)
+            
+            # チャンクを index 順に並べ替え
+            chunks_with_index = []
+            for i in range(len(result["documents"])):
+                meta = result["metadatas"][i]
+                index = meta.get("chunk_index", 0) if meta else 0
+                overlap = meta.get("overlap", 100) if meta else 100
+                chunks_with_index.append((index, result["documents"][i], overlap))
+            
+            chunks_with_index.sort(key=lambda x: x[0])
+            
+            # 結合 (チャンク間の重複部分を考慮して結合)
+            full_text = ""
+            for i, (index, content, overlap) in enumerate(chunks_with_index):
+                if i == 0:
+                    full_text = content
+                else:
+                    max_overlap = min(len(full_text), len(content), overlap + 50)
+                    actual_overlap = 0
+                    for j in range(max_overlap, 0, -1):
+                        if full_text.endswith(content[:j]):
+                            actual_overlap = j
+                            break
+                    full_text += content[actual_overlap:]
+            
+            print(f"[DEBUG] get_document_text: total length={len(full_text)}, tokens={count_tokens(full_text)}", file=sys.stderr)
+            
+            # セクション指定がある場合は抽出
+            if section:
+                extracted = extract_section_by_heading(full_text, section)
+                if extracted:
+                    print(f"[DEBUG] get_document_text: extracted section '{section}', tokens={count_tokens(extracted)}", file=sys.stderr)
+                    return extracted
+                else:
+                    # セクションが見つからない場合は、利用可能なセクション一覧を返す
+                    sections = parse_markdown_sections(full_text)
+                    available = [s.heading for s in sections[:20]]  # 最大20件
+                    return (
+                        f"[エラー: セクション '{section}' が見つかりませんでした。]\n\n"
+                        f"[利用可能なセクション:]\n" +
+                        "\n".join(f"- {h}" for h in available) +
+                        "\n\nget_document_content(path=\"" + doc_path + "\", section=\"セクション名\") で詳細を取得できます。"
+                    )
+            
+            # トークン制限の適用
+            effective_max_tokens = max_tokens or self.max_document_tokens
+            effective_detail_level = detail_level or self.detail_level
+            
+            total_tokens = count_tokens(full_text)
+            
+            # fullモードで予算内に収まる場合はそのまま返す
+            if effective_detail_level == "full" and total_tokens <= effective_max_tokens:
                 return full_text
-            print(f"[DEBUG] get_document_text: no chunks found for {doc_path}", file=sys.stderr)
-            return None
+            
+            # autoモードで予算内に収まる場合もそのまま返す
+            if effective_detail_level == "auto" and total_tokens <= effective_max_tokens:
+                return full_text
+            
+            # 圧縮が必要な場合
+            compressed_text, omitted_sections, was_compressed = compress_document_structure(
+                full_text,
+                budget_tokens=effective_max_tokens,
+                detail_level=effective_detail_level,
+            )
+            
+            if was_compressed:
+                print(f"[DEBUG] get_document_text: compressed from {total_tokens} to {count_tokens(compressed_text)} tokens", file=sys.stderr)
+            
+            return compressed_text
+            
         except Exception as e:
             print(f"Error getting document text: {e}", file=sys.stderr)
             return None
+    
+    def get_document_sections(self, doc_path: str) -> List[Dict[str, Any]]:
+        """
+        ドキュメントのセクション一覧を取得する。
+        
+        Returns:
+            [{"heading": str, "level": int, "tokens": int}, ...]
+        """
+        normalized_path = _normalize_path(doc_path)
+        try:
+            result = self._safe_collection_get(where={"path": normalized_path}, include=["documents"])
+            if not result or not result["documents"]:
+                return []
+            
+            # チャンクを結合
+            chunks_with_index = []
+            for i in range(len(result["documents"])):
+                chunks_with_index.append((i, result["documents"][i]))
+            chunks_with_index.sort(key=lambda x: x[0])
+            full_text = "".join(c[1] for c in chunks_with_index)
+            
+            sections = parse_markdown_sections(full_text)
+            return [
+                {
+                    "heading": s.heading,
+                    "level": s.level,
+                    "tokens": s.get_token_count(),
+                }
+                for s in sections
+            ]
+        except Exception as e:
+            print(f"Error getting document sections: {e}", file=sys.stderr)
+            return []
 
     def sync_documents(self, force: bool = False, allowed_roots=None, progress_callback=None) -> Dict[str, Any]:
         """
@@ -665,6 +998,25 @@ class RagEngine:
                         out_path = self.docs_dir / rel.with_suffix(".md")
                         valid_md_files.add(out_path.resolve())
                         
+                        rel_key = _normalize_path(str(rel))
+                        current_hash = _compute_file_hash(file_path)
+                        
+                        needs_conversion = True
+                        if current_hash:
+                            stored_hash = self.source_hashes.get(rel_key)
+                            if stored_hash:
+                                if stored_hash == current_hash and out_path.exists():
+                                    needs_conversion = False
+                                    print(f"Skipped conversion (content unchanged): {rel}", file=sys.stderr)
+                            elif out_path.exists():
+                                # Backward compatibility: no stored hash but MD exists
+                                needs_conversion = False
+                                self.source_hashes[rel_key] = current_hash
+                                print(f"Stored hash for existing MD (skipped conversion): {rel}", file=sys.stderr)
+                        
+                        if not needs_conversion:
+                            continue
+                        
                         # progress_callbackを FileConverter に渡す
                         def make_pdf_callback(fname):
                             def cb(current, total, _name):
@@ -679,9 +1031,24 @@ class RagEngine:
                             )
                             if converted:
                                 results["converted"] = results.get("converted", 0) + 1
+                                if current_hash:
+                                    self.source_hashes[rel_key] = current_hash
                         except Exception as e:
                             print(f"Conversion failed for {file_path.name}: {e}", file=sys.stderr)
                             results["errors"] = results.get("errors", 0) + 1
+                    
+                    # source_hashes から存在しないファイルのエントリを削除
+                    source_files_on_disk = set()
+                    for fp in source_dir.rglob("*"):
+                        if fp.is_file() and not fp.name.startswith("~$"):
+                            rel = fp.relative_to(source_dir)
+                            source_files_on_disk.add(_normalize_path(str(rel)))
+                    
+                    orphaned_hashes = [k for k in self.source_hashes if k not in source_files_on_disk]
+                    for k in orphaned_hashes:
+                        del self.source_hashes[k]
+                    if orphaned_hashes:
+                        print(f"Removed {len(orphaned_hashes)} orphaned hash entries", file=sys.stderr)
                     
                     # 許可カテゴリ内の孤児MDファイルを削除
                     for md_file in self.docs_dir.rglob("*.md"):
@@ -706,20 +1073,22 @@ class RagEngine:
 
                 # --- Step 2: converted_docs/ のMDを ChromaDB に同期 ---
                 try:
-                    current_items = self.collection.get(include=["metadatas"])
+                    current_items = self._safe_collection_get(include=["metadatas"])
                 except Exception as e:
                     print(f"Error retrieving collection data: {e}", file=sys.stderr)
                     current_items = None
                 
                 # Dictionary of (path: max_mtime_in_db)
                 db_mtimes = {}
+                # Dictionary of (path: content_hash_in_db)
+                db_hashes = {}
                 # Set of all indexed paths to track deletions
                 indexed_paths = set()
                 
                 if current_items and current_items["metadatas"]:
                     for meta in current_items["metadatas"]:
                         if meta and "path" in meta:
-                            p = meta["path"].replace("\\", "/")
+                            p = _normalize_path(meta["path"])
                             indexed_paths.add(p)
                             chunk_mtime = meta.get("mtime", 0.0)
                             # Get the max mtime among all chunks for this path safely
@@ -729,6 +1098,10 @@ class RagEngine:
                                     db_mtimes[p] = chunk_mtime
                             except (TypeError, ValueError):
                                 db_mtimes[p] = 0.0
+                            # Get the content_hash (all chunks for a file share the same hash)
+                            h = meta.get("content_hash", "")
+                            if h:
+                                db_hashes[p] = h
 
                 current_files_on_disk = set()
                 
@@ -740,7 +1113,7 @@ class RagEngine:
                     if file_path.suffix.lower() not in self.allowed_extensions:
                         continue
                         
-                    rel_path = str(file_path.relative_to(self.docs_dir)).replace("\\", "/")
+                    rel_path = _normalize_path(str(file_path.relative_to(self.docs_dir)))
                     current_files_on_disk.add(rel_path)
                     
                     try:
@@ -751,9 +1124,19 @@ class RagEngine:
                         continue
                     
                     is_new = rel_path not in indexed_paths
-                    # If force is true, we always update. Otherwise we check mtime.
-                    # Add a small epsilon (1.0) to avoid float precision issues
-                    needs_update = force or (file_mtime > db_mtimes.get(rel_path, 0.0) + 1.0)
+                    
+                    if force:
+                        needs_update = True
+                    elif is_new:
+                        needs_update = True
+                    elif rel_path in db_hashes:
+                        # Hash-based change detection (preferred)
+                        current_hash = _compute_file_hash(file_path)
+                        needs_update = current_hash != db_hashes[rel_path]
+                    else:
+                        # Fallback: mtime-based change detection for backward compatibility
+                        # (existing documents that don't have content_hash yet)
+                        needs_update = file_mtime > db_mtimes.get(rel_path, 0.0) + 1.0
                     
                     if is_new or needs_update:
                         try:
@@ -781,6 +1164,9 @@ class RagEngine:
                         print(f"Failed to delete {deleted_path} from index: {e}", file=sys.stderr)
                         results["errors"] = results.get("errors", 0) + 1
 
+                # 元ファイルハッシュ状態を保存
+                self._save_source_hashes()
+                
                 # BM25 インデックスを同期後に一括更新
                 self._build_bm25_corpus()
 

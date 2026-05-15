@@ -1,3 +1,7 @@
+import os
+os.environ["CHROMA_TELEMETRY"] = "FALSE"
+os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
+
 import argparse
 import sys
 from rag_engine import RagEngine

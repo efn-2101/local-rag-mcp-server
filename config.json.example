@@ -20,6 +20,24 @@
     "flashrank_offline_mode": false
   },
   
+  "context_management": {
+    "detail_level": "auto",
+    "max_context_tokens": 128000,
+    "max_document_tokens": 12000,
+    "max_search_result_tokens": 8000,
+    "summary_model": null,
+    "ollama_base_url": null
+  },
+  
+  "_context_management_help": {
+    "detail_level": "Document detail level: 'auto' (default, compress only when exceeding limits), 'summary' (always compress), 'full' (never compress).",
+    "max_context_tokens": "LLM context window size in tokens. Default: 128000 (128K models).",
+    "max_document_tokens": "Max tokens for get_document_content. Default: 12000.",
+    "max_search_result_tokens": "Max tokens for search_documents results. Default: 8000.",
+    "summary_model": "Ollama model for LLM-based summarization (optional). null = use structure-based compression only.",
+    "ollama_base_url": "Separate Ollama server URL for summarization (optional). null = use default ollama_base_url."
+  },
+  
   "_ocr_help": {
     "ocr_engine": "OCR engine to use: 'ollama' (default) or 'paddleocr' (optional)",
     "ocr_model": "Ollama model for OCR (default: glm-ocr:latest). Make sure the model is pulled in Ollama.",

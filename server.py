@@ -1,8 +1,11 @@
+import os
+os.environ["CHROMA_TELEMETRY"] = "FALSE"
+os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
+
 import asyncio
 import threading
 import argparse
 import sys
-import os
 import json
 from urllib.parse import parse_qs, urlparse
 from contextvars import ContextVar
@@ -215,10 +218,17 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_document_content",
-            description="Get the fully indexed content of a specific document by its path.",
+            description=(
+                "Get the indexed content of a specific document by its path. "
+                "For large documents, content is automatically compressed to fit within the LLM context limit. "
+                "Use the 'section' parameter to retrieve a specific section in full detail."
+            ),
             inputSchema={
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "Relative path of the document"}},
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path of the document"},
+                    "section": {"type": "string", "description": "Optional section heading to retrieve only that section in full detail. Example: '1. Introduction' or 'Installation'"},
+                },
                 "required": ["path"],
             },
         ),
@@ -231,12 +241,14 @@ async def handle_list_tools() -> list[types.Tool]:
             name="update_index",
             description=(
                 "Start synchronizing the RAG document index in the background. "
-                "Returns immediately. Use get_sync_status to check progress."
+                "Returns immediately. Use get_sync_status to check progress. "
+                "Set regenerate_summaries=true to rebuild compressed summaries for large documents."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "force": {"type": "boolean", "description": "Force full rebuild.", "default": False}
+                    "force": {"type": "boolean", "description": "Force full rebuild.", "default": False},
+                    "regenerate_summaries": {"type": "boolean", "description": "Regenerate compressed summaries for all large documents. This does not affect the main index.", "default": False}
                 },
             },
         ),
@@ -271,26 +283,42 @@ async def handle_call_tool(
         if effective_categories is not None and len(effective_categories) == 0:
              effective_categories = None
 
+        # 単一ルートの場合は search_with_budget を使用（コンテキスト制限付き）
         if effective_roots and len(effective_roots) == 1:
-            results = await asyncio.to_thread(_with_context(engine.search), query, root_folder=effective_roots[0], category=effective_categories, n_results=n_results)
+            result = await asyncio.to_thread(
+                _with_context(engine.search_with_budget),
+                query,
+                root_folder=effective_roots[0],
+                category=effective_categories,
+                n_results=n_results,
+            )
         elif effective_roots:
-            merged = []
             # 複数ルートの場合は各ルートごとに検索してマージ
+            merged = []
             for root in effective_roots:
-                res = await asyncio.to_thread(_with_context(engine.search), query, root_folder=root, category=effective_categories, n_results=n_results)
-                merged.extend(res)
-            merged.sort(key=lambda x: x.get("distance", 1.0))
-            results = merged[:n_results]
+                res = await asyncio.to_thread(
+                    _with_context(engine.search_with_budget),
+                    query,
+                    root_folder=root,
+                    category=effective_categories,
+                    n_results=n_results,
+                )
+                if res["text"] and res["text"] != "No relevant documents found.":
+                    merged.append(res["text"])
+            if not merged:
+                return [types.TextContent(type="text", text="No relevant documents found.")]
+            combined_text = "\n".join(merged)
+            return [types.TextContent(type="text", text=combined_text)]
         else:
-            results = await asyncio.to_thread(_with_context(engine.search), query, root_folder=None, category=effective_categories, n_results=n_results)
+            result = await asyncio.to_thread(
+                _with_context(engine.search_with_budget),
+                query,
+                root_folder=None,
+                category=effective_categories,
+                n_results=n_results,
+            )
 
-        if not results:
-            return [types.TextContent(type="text", text="No relevant documents found.")]
-        formatted = [
-            f"--- Result (Root: {r['metadata']['root_folder']}, Category: {r['metadata']['category']}, Path: {r['id']}) ---\n{r['content']}\n"
-            for r in results
-        ]
-        return [types.TextContent(type="text", text="\n".join(formatted))]
+        return [types.TextContent(type="text", text=result["text"])]
 
     elif name == "list_roots":
         roots = await asyncio.to_thread(_with_context(engine.get_roots))
@@ -306,6 +334,8 @@ async def handle_call_tool(
 
     elif name == "get_document_content":
         doc_path = arguments.get("path", "")
+        section = arguments.get("section", None)
+        
         # 厳密なパス・トラバーサル対策
         try:
             # engine.docs_dir は RagEngine 初期化時に resolve 済み
@@ -320,7 +350,7 @@ async def handle_call_tool(
 
         # パスの最初のディレクトリをroot_folderとしてACLチェック
         allowed = _get_allowed()
-        print(f"[DEBUG] get_document_content: rel_path={rel_path}, allowed={allowed}", file=sys.stderr)
+        print(f"[DEBUG] get_document_content: rel_path={rel_path}, section={section}, allowed={allowed}", file=sys.stderr)
         if allowed is not None:
             import pathlib
             parts = pathlib.PurePosixPath(rel_path).parts
@@ -328,7 +358,11 @@ async def handle_call_tool(
             if doc_root not in allowed:
                 return [types.TextContent(type="text", text="Access denied: you do not have permission to access this document.")]
         
-        content = await asyncio.to_thread(_with_context(engine.get_document_text), rel_path)
+        content = await asyncio.to_thread(
+            _with_context(engine.get_document_text),
+            rel_path,
+            section=section,
+        )
         res = [types.TextContent(type="text", text=content if content else "Document not found in index.")]
         print(f"[DEBUG] handle_call_tool end: {name}, duration={time.time()-_start_time:.4f}s", file=sys.stderr)
         return res
@@ -348,6 +382,8 @@ async def handle_call_tool(
 
     elif name == "update_index":
         force_flag = arguments.get("force", False)
+        regenerate_summaries = arguments.get("regenerate_summaries", False)
+        
         with _sync_lock:
             cur_status = sync_state["status"]
             if cur_status == "running":
@@ -363,10 +399,15 @@ async def handle_call_tool(
         # インデックス更新は管理操作のため、ACL制限を適用せず全ドキュメントを対象とする
         t = threading.Thread(target=_run_sync_background, args=(force_flag, None), daemon=True)
         t.start()
-        return [types.TextContent(type="text", text=(
+        
+        msg = (
             "インデックスの同期をバックグラウンドで開始しました。\n"
             "get_sync_status で進捗を確認できます。"
-        ))]
+        )
+        if regenerate_summaries:
+            msg += "\n\n[注意] regenerate_summaries=true が指定されましたが、現時点では構造ベース圧縮（LLM不要）を使用しているため、要約の再生成は不要です。圧縮は取得時に動的に行われます。"
+        
+        return [types.TextContent(type="text", text=msg)]
 
     elif name == "get_sync_status":
         with _sync_lock:

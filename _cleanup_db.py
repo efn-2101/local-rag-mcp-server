@@ -1,11 +1,14 @@
 """Remove backslash-path data from ChromaDB directly."""
 import os
+os.environ["CHROMA_TELEMETRY"] = "FALSE"
+os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
+
 from rag_engine import RagEngine
 
 engine = RagEngine()
 
 # Get all paths in DB
-items = engine.collection.get(include=["metadatas"])
+items = engine._safe_collection_get(include=["metadatas"])
 all_paths = set()
 if items and items["metadatas"]:
     for meta in items["metadatas"]:
@@ -28,7 +31,7 @@ for p in list(all_paths):
 print(f"\nTotal deleted: {deleted_total} chunks")
 
 # Verify
-items2 = engine.collection.get(include=["metadatas"])
+items2 = engine._safe_collection_get(include=["metadatas"])
 remaining = set()
 if items2 and items2["metadatas"]:
     for meta in items2["metadatas"]:
