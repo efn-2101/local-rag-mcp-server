@@ -221,7 +221,7 @@ docker-compose exec mcp-server python stop.py
 
 | キー | 説明 |
 |------|------|
-| `source_docs_dir` | 元文書フォルダの**絶対パス**（共有フォルダを指定） |
+| `source_docs_dir` | 元文書フォルダの**絶対パスまたは相対パス**（server.py からの相対） |
 | `docs_dir` | 変換済み Markdown の保存先（相対パス） |
 | `embedding_model` | Ollama の埋め込みモデル名 |
 | `ocr_engine` | OCRエンジン（`ollama` または `paddleocr`） |
@@ -570,6 +570,40 @@ python _cleanup_db.py
 ## CLINE への接続設定
 
 管理者から提供された URL・API キーを CLINE の MCP サーバー設定に追加してください。
+
+### stdio モード（ローカル実行・推奨）
+
+サーバーをローカルで直接起動する場合は `stdio` モードを使用します。SSEモードと異なり、HTTPサーバーを起動する必要がなく、セキュリティ的にも安全です。
+
+```json
+{
+  "mcpServers": {
+    "local-rag": {
+      "command": "python",
+      "args": ["server.py", "--transport", "stdio"],
+      "cwd": "D:\\tools\\local-rag-mcp-server",
+      "env": {
+        "MCP_API_KEY": "your-api-key-here",
+        "DEFAULT_ROOTS": "Group A",
+        "DEFAULT_CATEGORIES": ""
+      }
+    }
+  }
+}
+```
+
+| 環境変数 | 説明 |
+|----------|------|
+| `MCP_API_KEY` | `acl.json` に定義した API キー |
+| `DEFAULT_ROOTS` | デフォルトで検索するルートフォルダ（カンマ区切りで複数指定可） |
+| `DEFAULT_CATEGORIES` | デフォルトで検索するサブフォルダ（カンマ区切りで複数指定可） |
+
+> [!TIP]
+> Windowsパスを指定する場合、環境変数では `D:/tools/documents` のようにフォワードスラッシュを使用するか、`D:\\tools\\documents` のようにバックスラッシュを2つ重ねてください。本サーバーは自動的にフォワードスラッシュに正規化します。
+
+### SSE モード（HTTP経由）
+
+SSEモードを使用する場合は、以下のように URL とヘッダーを設定します。
 
 ### フォルダ名が英語の場合（推奨）
 

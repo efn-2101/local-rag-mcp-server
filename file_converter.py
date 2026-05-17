@@ -93,21 +93,26 @@ class FileConverter:
             return ""
 
     def extract_text_from_xlsx(self, file_path: Path) -> str:
-        try:
-            wb = load_workbook(file_path, data_only=True)
-            text_parts = [f"# XLSX Content: {file_path.name}\n"]
-            for sheet in wb.sheetnames:
-                ws = wb[sheet]
-                text_parts.append(f"## Sheet: {sheet}")
-                # Simple Markdown table conversion could be added here, currently tab-separated
-                for row in ws.iter_rows(values_only=True):
-                    row_text = " | ".join([str(cell) if cell is not None else "" for cell in row])
-                    if row_text.strip().replace("|", ""):
-                         text_parts.append(f"| {row_text} |")
-            return "\n\n".join(text_parts)
-        except Exception as e:
-            print(f"Error reading XLSX {file_path}: {e}", file=sys.stderr)
-            return ""
+        # BUG-014 fix: Try data_only=True first, fallback to data_only=False for formulas
+        for data_only in [True, False]:
+            try:
+                wb = load_workbook(file_path, data_only=data_only)
+                text_parts = [f"# XLSX Content: {file_path.name}\n"]
+                for sheet in wb.sheetnames:
+                    ws = wb[sheet]
+                    text_parts.append(f"## Sheet: {sheet}")
+                    # Simple Markdown table conversion could be added here, currently tab-separated
+                    for row in ws.iter_rows(values_only=True):
+                        row_text = " | ".join([str(cell) if cell is not None else "" for cell in row])
+                        if row_text.strip().replace("|", ""):
+                             text_parts.append(f"| {row_text} |")
+                return "\n\n".join(text_parts)
+            except Exception as e:
+                if data_only:
+                    print(f"Warning: data_only=True failed for {file_path.name}, trying data_only=False: {e}", file=sys.stderr)
+                else:
+                    print(f"Error reading XLSX {file_path}: {e}", file=sys.stderr)
+        return ""
 
     def extract_text_from_pptx(self, file_path: Path) -> str:
         try:

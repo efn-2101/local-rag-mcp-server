@@ -13,10 +13,25 @@ class DocumentHandler(FileSystemEventHandler):
     def __init__(self, engine: RagEngine):
         self.engine = engine
 
+    def _to_relative_path(self, abs_path: str):
+        """絶対パスを docs_dir からの相対パスに変換"""
+        from typing import Optional
+        try:
+            p = Path(abs_path).resolve()
+            docs_dir = self.engine.docs_dir.resolve()
+            if not str(p).startswith(str(docs_dir)):
+                return None
+            return p.relative_to(docs_dir)
+        except Exception:
+            return None
+
     def on_modified(self, event):
         if not event.is_directory:
             try:
-                normalized_path = Path(_normalize_path(event.src_path))
+                rel_path = self._to_relative_path(event.src_path)
+                if rel_path is None:
+                    return
+                normalized_path = Path(_normalize_path(str(rel_path)))
                 print(f"File modified: {normalized_path}", file=sys.stderr)
                 if self.engine.has_document_changed(normalized_path):
                     self.engine.add_document(normalized_path)
@@ -28,7 +43,10 @@ class DocumentHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory:
             try:
-                normalized_path = Path(_normalize_path(event.src_path))
+                rel_path = self._to_relative_path(event.src_path)
+                if rel_path is None:
+                    return
+                normalized_path = Path(_normalize_path(str(rel_path)))
                 print(f"File created: {normalized_path}", file=sys.stderr)
                 self.engine.add_document(normalized_path)
             except Exception as e:
@@ -37,7 +55,10 @@ class DocumentHandler(FileSystemEventHandler):
     def on_deleted(self, event):
         if not event.is_directory:
             try:
-                normalized_path = Path(_normalize_path(event.src_path))
+                rel_path = self._to_relative_path(event.src_path)
+                if rel_path is None:
+                    return
+                normalized_path = Path(_normalize_path(str(rel_path)))
                 print(f"File deleted: {normalized_path}", file=sys.stderr)
                 # delete_documentは相対パスが必要
                 self.engine.delete_document(normalized_path)
@@ -47,8 +68,12 @@ class DocumentHandler(FileSystemEventHandler):
     def on_moved(self, event):
         if not event.is_directory:
             try:
-                src_normalized = Path(_normalize_path(event.src_path))
-                dest_normalized = Path(_normalize_path(event.dest_path))
+                src_rel = self._to_relative_path(event.src_path)
+                dest_rel = self._to_relative_path(event.dest_path)
+                if src_rel is None or dest_rel is None:
+                    return
+                src_normalized = Path(_normalize_path(str(src_rel)))
+                dest_normalized = Path(_normalize_path(str(dest_rel)))
                 print(f"File moved from {src_normalized} to {dest_normalized}", file=sys.stderr)
                 self.engine.delete_document(src_normalized)
                 self.engine.add_document(dest_normalized)

@@ -113,7 +113,10 @@ class OllamaOCREngine(OCREngine):
         stripped = text.strip()
         if not stripped:
             return False
-        if self._OCR_PROMPT in stripped:
+        # BUG-011 fix: Use similarity-based prompt echo detection
+        prompt_words = set(self._OCR_PROMPT.split())
+        text_words = set(stripped.split())
+        if prompt_words and len(prompt_words & text_words) / len(prompt_words) > 0.8:
             print("OCR validation failed: prompt echo detected", file=sys.stderr)
             return False
         non_space = stripped.replace(' ', '').replace('\n', '').replace('\t', '')

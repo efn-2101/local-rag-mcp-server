@@ -63,6 +63,11 @@ def _compute_file_hash(file_path: Path) -> str:
         return ""
 
 
+def _compute_text_hash(text: str) -> str:
+    """テキスト内容のSHA-256ハッシュを計算する"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class RagEngine:
     def __init__(self, config_path: str = "config.json"):
         # Resolve config_path relative to this script's directory
@@ -249,6 +254,8 @@ class RagEngine:
         - 空コレクション時は即座に空結果を返す
         - limit/offset で分割取得し、大規模コレクションでも安全
         """
+        # BUG-017 fix: Normalize include parameter
+        include = include or []
         BATCH_SIZE = 5000  # SQLite 32,767 制限の余裕を持たせる
         
         # 空コレクション回避: count() は軽量
@@ -357,6 +364,11 @@ class RagEngine:
         """テキストをチャンクに分割する"""
         if not text:
             return []
+        
+        # BUG-008 fix: Prevent extreme performance degradation
+        if overlap >= chunk_size:
+            print(f"Warning: overlap ({overlap}) >= chunk_size ({chunk_size}). Setting overlap to chunk_size // 2.", file=sys.stderr)
+            overlap = chunk_size // 2
             
         print(f"[DEBUG] chunk_text: text_len={len(text)}, chunk_size={chunk_size}, overlap={overlap}", file=sys.stderr)
         chunks = []
@@ -467,8 +479,15 @@ class RagEngine:
             if result and result["metadatas"]:
                 db_hash = result["metadatas"][0].get("content_hash", "")
                 if db_hash:
-                    current_hash = _compute_file_hash(file_path)
-                    return current_hash != db_hash
+                    # BUG-002 fix: Use text hash instead of binary file hash
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        current_hash = _compute_text_hash(content)
+                        return current_hash != db_hash
+                    except Exception as e:
+                        print(f"Error reading file for hash comparison {rel_path}: {e}", file=sys.stderr)
+                        return True
                 # Fallback to mtime for backward compatibility
                 db_mtime = result["metadatas"][0].get("mtime", 0.0)
                 file_mtime = os.path.getmtime(file_path)
@@ -503,6 +522,10 @@ class RagEngine:
         dense_ranks = {item["id"]: idx + 1 for idx, item in enumerate(dense_results)}
         sparse_ranks = {item["id"]: idx + 1 for idx, item in enumerate(sparse_results)}
         
+        # Build id -> item lookup dicts for correct retrieval (BUG-001 fix)
+        dense_by_id = {item["id"]: item for item in dense_results}
+        sparse_by_id = {item["id"]: item for item in sparse_results}
+        
         # Collect all unique IDs
         all_ids = set(dense_ranks.keys()) | set(sparse_ranks.keys())
         print(f"[DEBUG] _rrf_fusion: all_ids_count={len(all_ids)}, dense_ranks_count={len(dense_ranks)}, sparse_ranks_count={len(sparse_ranks)}", file=sys.stderr)
@@ -520,25 +543,15 @@ class RagEngine:
             if sparse_rank != float('inf'):
                 rrf_score += 1.0 / (k + sparse_rank)
             
-            # Get the document content from either result
+            # Get the document content from either result using id lookup (BUG-001 fix)
             doc_content = None
             doc_metadata = None
-            if doc_id in dense_ranks:
-                dense_idx = dense_ranks[doc_id] - 1
-                print(f"[DEBUG] _rrf_fusion: accessing dense_results[{dense_idx}] for id={doc_id}", file=sys.stderr)
-                if 0 <= dense_idx < len(dense_results):
-                    doc_content = dense_results[dense_idx]["content"]
-                    doc_metadata = dense_results[dense_idx]["metadata"]
-                else:
-                    print(f"[DEBUG] _rrf_fusion: IndexError avoided for dense_idx={dense_idx}", file=sys.stderr)
-            else:
-                sparse_idx = sparse_ranks[doc_id] - 1
-                print(f"[DEBUG] _rrf_fusion: accessing sparse_results[{sparse_idx}] for id={doc_id}", file=sys.stderr)
-                if 0 <= sparse_idx < len(sparse_results):
-                    doc_content = sparse_results[sparse_idx]["content"]
-                    doc_metadata = sparse_results[sparse_idx]["metadata"]
-                else:
-                    print(f"[DEBUG] _rrf_fusion: IndexError avoided for sparse_idx={sparse_idx}", file=sys.stderr)
+            if doc_id in dense_by_id:
+                doc_content = dense_by_id[doc_id]["content"]
+                doc_metadata = dense_by_id[doc_id]["metadata"]
+            elif doc_id in sparse_by_id:
+                doc_content = sparse_by_id[doc_id]["content"]
+                doc_metadata = sparse_by_id[doc_id]["metadata"]
             
             rrf_scores.append({
                 "id": doc_id,
@@ -589,7 +602,7 @@ class RagEngine:
         all_results.sort(key=lambda x: x["bm25_score"], reverse=True)
         return all_results[:n_results]
 
-    def search(self, query: str, root_folder: Optional[str] = None, category: Optional[str] = None, n_results: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, root_folder: Optional[str] = None, category: Optional[Union[str, List[str]]] = None, n_results: int = 5) -> List[Dict[str, Any]]:
         """
         ハイブリッド検索パイプライン（4 ステップ）:
         Step 1: Retrieval（初期検索）
@@ -699,7 +712,7 @@ class RagEngine:
         self,
         query: str,
         root_folder: Optional[str] = None,
-        category: Optional[str] = None,
+        category: Optional[Union[str, List[str]]] = None,
         n_results: int = 5,
         max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1029,13 +1042,17 @@ class RagEngine:
                                 file_path, out_path,
                                 progress_callback=make_pdf_callback(file_path.name)
                             )
-                            if converted:
-                                results["converted"] = results.get("converted", 0) + 1
+                            if converted is True:
+                                results["converted"] = results["converted"] + 1
                                 if current_hash:
                                     self.source_hashes[rel_key] = current_hash
+                            elif converted is None:
+                                # BUG-004 fix: OCR failure should be counted as error
+                                results["errors"] = results["errors"] + 1
+                                print(f"Conversion failed (OCR error): {rel}", file=sys.stderr)
                         except Exception as e:
                             print(f"Conversion failed for {file_path.name}: {e}", file=sys.stderr)
-                            results["errors"] = results.get("errors", 0) + 1
+                            results["errors"] = results["errors"] + 1
                     
                     # source_hashes から存在しないファイルのエントリを削除
                     source_files_on_disk = set()
@@ -1144,14 +1161,14 @@ class RagEngine:
                                 progress_callback("indexing", 0, 0, rel_path)
                             self.add_document(file_path)
                             if is_new:
-                                results["added"] = results.get("added", 0) + 1
+                                results["added"] = results["added"] + 1
                             else:
-                                results["updated"] = results.get("updated", 0) + 1
+                                results["updated"] = results["updated"] + 1
                         except Exception as e:
                             print(f"Failed to index {rel_path}: {e}", file=sys.stderr)
-                            results["errors"] = results.get("errors", 0) + 1
+                            results["errors"] = results["errors"] + 1
                     else:
-                        results["skipped"] = results.get("skipped", 0) + 1
+                        results["skipped"] = results["skipped"] + 1
 
                 # Find deleted files (in db but not on disk)
                 deleted_files = indexed_paths - current_files_on_disk
@@ -1159,10 +1176,10 @@ class RagEngine:
                     try:
                         abs_path = self.docs_dir / deleted_path
                         self.delete_document(abs_path)
-                        results["deleted"] = results.get("deleted", 0) + 1
+                        results["deleted"] = results["deleted"] + 1
                     except Exception as e:
                         print(f"Failed to delete {deleted_path} from index: {e}", file=sys.stderr)
-                        results["errors"] = results.get("errors", 0) + 1
+                        results["errors"] = results["errors"] + 1
 
                 # 元ファイルハッシュ状態を保存
                 self._save_source_hashes()

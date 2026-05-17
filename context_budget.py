@@ -229,6 +229,22 @@ def extract_section_by_heading(text: str, section_query: str) -> Optional[str]:
 # 構造ベース圧縮（LLM不要）
 # ---------------------------------------------------------------------------
 
+# Common English abbreviations that end with a period
+_ABBREVIATIONS = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'no', 'pp', 'et', 'al',
+    'i.e', 'e.g', 'vs', 'vol', 'vols', 'inc', 'ltd', 'jr', 'sr',
+    'st', 'ave', 'blvd', 'rd', 'dept', 'univ', 'corp', 'co',
+    'fig', 'figs', 'et al', 'et al.', 'i.e.', 'e.g.', 'vs.',
+    'mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'no.',
+}
+
+
+def _is_abbreviation(word: str) -> bool:
+    """単語が略称かどうかを判定（末尾の句読点を除去）"""
+    cleaned = word.rstrip('.').lower()
+    return cleaned in _ABBREVIATIONS
+
+
 def _split_sentences(text: str) -> List[str]:
     """日本語・英語の文を分割する簡易実装。"""
     # 日本語: 。！？で分割
@@ -242,9 +258,12 @@ def _split_sentences(text: str) -> List[str]:
             sentences.append(current.strip())
             current = ""
         elif text[i] in '.!?' and i > 0:
-            # 略称の可能性をチェック
-            prev_word = current[-10:-1].strip().split()[-1] if len(current) > 10 else ""
-            if prev_word not in ('Mr', 'Dr', 'Ms', 'Mrs', 'Prof', 'No', 'pp', 'et', 'al', 'i.e', 'e.g'):
+            # BUG-010 fix: Improved abbreviation detection
+            # Get the last word before the punctuation
+            text_before = current[:-1]  # Exclude the punctuation itself
+            words = text_before.strip().split()
+            last_word = words[-1] if words else ""
+            if not _is_abbreviation(last_word):
                 sentences.append(current.strip())
                 current = ""
         i += 1

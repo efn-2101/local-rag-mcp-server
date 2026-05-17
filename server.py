@@ -11,12 +11,6 @@ from urllib.parse import parse_qs, urlparse
 from contextvars import ContextVar
 from mcp.server.models import InitializationOptions
 from mcp.server import Server, NotificationOptions
-from mcp.server.sse import SseServerTransport
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.responses import Response
-from starlette.middleware.cors import CORSMiddleware
-import uvicorn
 import mcp.types as types
 from rag_engine import RagEngine
 from pathlib import Path
@@ -32,8 +26,7 @@ def _with_context(func):
         return ctx.run(func, *args, **kwargs)
     return wrapper
 
-print("Initializing RAG Engine...", file=sys.stderr)
-engine = RagEngine()
+engine = None
 server = Server("local-rag-server")
 
 # ---------------------------------------------------------------------------
@@ -100,26 +93,33 @@ _ctx_allowed: ContextVar[Any] = ContextVar("allowed_roots", default=_UNSET)
 _ctx_default: ContextVar[list] = ContextVar("default_roots", default=[])
 _ctx_categories: ContextVar[list] = ContextVar("default_categories", default=[])
 
+# Cache for stdio mode environment variable lookup (BUG-018 fix)
+_stdio_env_cache: Optional[set] = None
+
 def _get_allowed() -> Optional[set]:
     val = _ctx_allowed.get()
     if val is _UNSET:
+        global _stdio_env_cache
+        if _stdio_env_cache is not None:
+            return _stdio_env_cache
         # stdioモード: 環境変数から取得
         api_key = os.environ.get("MCP_API_KEY", "").strip()
-        return _resolve_allowed_roots(api_key)
+        _stdio_env_cache = _resolve_allowed_roots(api_key)
+        return _stdio_env_cache
     return val  # set（許可ルート）または None（制限なし）
 
 def _get_default() -> list:
     val = _ctx_default.get()
     if not val:
         env_roots = os.environ.get("DEFAULT_ROOTS", "").strip()
-        return [c.strip() for c in env_roots.split(",") if c.strip()]
+        return [c.strip().replace("\\", "/") for c in env_roots.split(",") if c.strip()]
     return val
 
 def _get_default_categories() -> list:
     val = _ctx_categories.get()
     if not val:
         env_cats = os.environ.get("DEFAULT_CATEGORIES", "").strip()
-        return [c.strip() for c in env_cats.split(",") if c.strip()]
+        return [c.strip().replace("\\", "/") for c in env_cats.split(",") if c.strip()]
     return val
 
 def get_effective_roots(requested: Optional[str] = None) -> Optional[list]:
@@ -147,7 +147,18 @@ def get_effective_categories(requested: Optional[str] = None) -> Optional[list]:
 # SSEセッションレジストリ（session_id → auth情報）
 # handle_sse内のインターセプトで登録し、デバッグ用に使う
 # ---------------------------------------------------------------------------
+import time
 _session_registry: dict = {}
+
+def _cleanup_old_sessions(max_age_seconds: int = 3600):
+    """古いセッションをクリーンアップ（BUG-012 fix）"""
+    now = time.time()
+    expired = [sid for sid, data in _session_registry.items()
+               if now - data.get("created_at", 0) > max_age_seconds]
+    for sid in expired:
+        del _session_registry[sid]
+    if expired:
+        print(f"Cleaned up {len(expired)} expired sessions", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # ① 同期状態管理
@@ -270,168 +281,180 @@ async def handle_call_tool(
     if arguments is None:
         arguments = {}
 
-    if name == "search_documents":
-        query = arguments.get("query")
-        n_results = arguments.get("n_results", 5)
-        effective_roots = get_effective_roots(arguments.get("root"))
-        effective_categories = get_effective_categories(arguments.get("category"))
+    try:
+        if name == "search_documents":
+            query = arguments.get("query")
+            n_results = arguments.get("n_results", 5)
+            effective_roots = get_effective_roots(arguments.get("root"))
+            effective_categories = get_effective_categories(arguments.get("category"))
 
-        if effective_roots is not None and len(effective_roots) == 0:
-            return [types.TextContent(type="text", text="Access denied: you do not have permission to access the requested category.")]
+            if effective_roots is not None and len(effective_roots) == 0:
+                return [types.TextContent(type="text", text="Access denied: you do not have permission to access the requested category.")]
 
-        # If effective_categories is empty list [], we might want to treat it as None to avoid chromadb error
-        if effective_categories is not None and len(effective_categories) == 0:
-             effective_categories = None
+            # If effective_categories is empty list [], we might want to treat it as None to avoid chromadb error
+            if effective_categories is not None and len(effective_categories) == 0:
+                 effective_categories = None
 
-        # 単一ルートの場合は search_with_budget を使用（コンテキスト制限付き）
-        if effective_roots and len(effective_roots) == 1:
-            result = await asyncio.to_thread(
-                _with_context(engine.search_with_budget),
-                query,
-                root_folder=effective_roots[0],
-                category=effective_categories,
-                n_results=n_results,
-            )
-        elif effective_roots:
-            # 複数ルートの場合は各ルートごとに検索してマージ
-            merged = []
-            for root in effective_roots:
-                res = await asyncio.to_thread(
+            # 単一ルートの場合は search_with_budget を使用（コンテキスト制限付き）
+            if effective_roots and len(effective_roots) == 1:
+                result = await asyncio.to_thread(
                     _with_context(engine.search_with_budget),
                     query,
-                    root_folder=root,
+                    root_folder=effective_roots[0],
                     category=effective_categories,
                     n_results=n_results,
                 )
-                if res["text"] and res["text"] != "No relevant documents found.":
-                    merged.append(res["text"])
-            if not merged:
-                return [types.TextContent(type="text", text="No relevant documents found.")]
-            combined_text = "\n".join(merged)
-            return [types.TextContent(type="text", text=combined_text)]
-        else:
-            result = await asyncio.to_thread(
-                _with_context(engine.search_with_budget),
-                query,
-                root_folder=None,
-                category=effective_categories,
-                n_results=n_results,
-            )
+            elif effective_roots:
+                # 複数ルートの場合は各ルートごとに検索してマージ
+                merged = []
+                for root in effective_roots:
+                    res = await asyncio.to_thread(
+                        _with_context(engine.search_with_budget),
+                        query,
+                        root_folder=root,
+                        category=effective_categories,
+                        n_results=n_results,
+                    )
+                    if res["text"] and res["text"] != "No relevant documents found.":
+                        merged.append(res["text"])
+                if not merged:
+                    return [types.TextContent(type="text", text="No relevant documents found.")]
+                combined_text = "\n".join(merged)
+                return [types.TextContent(type="text", text=combined_text)]
+            else:
+                result = await asyncio.to_thread(
+                    _with_context(engine.search_with_budget),
+                    query,
+                    root_folder=None,
+                    category=effective_categories,
+                    n_results=n_results,
+                )
 
-        return [types.TextContent(type="text", text=result["text"])]
+            return [types.TextContent(type="text", text=result["text"])]
 
-    elif name == "list_roots":
-        roots = await asyncio.to_thread(_with_context(engine.get_roots))
-        allowed = _get_allowed()
-        if allowed is not None:
-            roots = [c for c in roots if c in allowed]
-        return [types.TextContent(type="text", text=f"Available root folders: {', '.join(roots)}")]
+        elif name == "list_roots":
+            roots = await asyncio.to_thread(_with_context(engine.get_roots))
+            allowed = _get_allowed()
+            if allowed is not None:
+                roots = [c for c in roots if c in allowed]
+            return [types.TextContent(type="text", text=f"Available root folders: {', '.join(roots)}")]
 
-    elif name == "list_categories":
-        allowed = _get_allowed()
-        categories = await asyncio.to_thread(_with_context(engine.get_categories), allowed_roots=allowed)
-        return [types.TextContent(type="text", text=f"Available categories: {', '.join(categories)}")]
+        elif name == "list_categories":
+            allowed = _get_allowed()
+            categories = await asyncio.to_thread(_with_context(engine.get_categories), allowed_roots=allowed)
+            return [types.TextContent(type="text", text=f"Available categories: {', '.join(categories)}")]
 
-    elif name == "get_document_content":
-        doc_path = arguments.get("path", "")
-        section = arguments.get("section", None)
+        elif name == "get_document_content":
+            doc_path = arguments.get("path", "")
+            section = arguments.get("section", None)
         
-        # 厳密なパス・トラバーサル対策
-        try:
-            # engine.docs_dir は RagEngine 初期化時に resolve 済み
-            requested_path = (engine.docs_dir / doc_path).resolve()
-            if not str(requested_path).startswith(str(engine.docs_dir)):
-                return [types.TextContent(type="text", text="Access denied: path traversal detected.")]
+            # 厳密なパス・トラバーサル対策
+            try:
+                # engine.docs_dir は RagEngine 初期化時に resolve 済み
+                requested_path = (engine.docs_dir / doc_path).resolve()
+                if not str(requested_path).startswith(str(engine.docs_dir)):
+                    return [types.TextContent(type="text", text="Access denied: path traversal detected.")]
             
-            # 相対パスに戻して ACL チェック
-            rel_path = str(requested_path.relative_to(engine.docs_dir)).replace("\\", "/")
-        except Exception as e:
-            return [types.TextContent(type="text", text=f"Invalid path: {e}")]
+                # 相対パスに戻して ACL チェック
+                rel_path = str(requested_path.relative_to(engine.docs_dir)).replace("\\", "/")
+            except Exception as e:
+                return [types.TextContent(type="text", text=f"Invalid path: {e}")]
 
-        # パスの最初のディレクトリをroot_folderとしてACLチェック
-        allowed = _get_allowed()
-        print(f"[DEBUG] get_document_content: rel_path={rel_path}, section={section}, allowed={allowed}", file=sys.stderr)
-        if allowed is not None:
-            import pathlib
-            parts = pathlib.PurePosixPath(rel_path).parts
-            doc_root = parts[0] if len(parts) > 0 else ""
-            if doc_root not in allowed:
-                return [types.TextContent(type="text", text="Access denied: you do not have permission to access this document.")]
+            # パスの最初のディレクトリをroot_folderとしてACLチェック
+            allowed = _get_allowed()
+            print(f"[DEBUG] get_document_content: rel_path={rel_path}, section={section}, allowed={allowed}", file=sys.stderr)
+            if allowed is not None:
+                import pathlib
+                parts = pathlib.PurePosixPath(_normalize_path(rel_path)).parts
+                doc_root = parts[0] if len(parts) > 0 else ""
+                if doc_root not in allowed:
+                    return [types.TextContent(type="text", text="Access denied: you do not have permission to access this document.")]
         
-        content = await asyncio.to_thread(
-            _with_context(engine.get_document_text),
-            rel_path,
-            section=section,
-        )
-        res = [types.TextContent(type="text", text=content if content else "Document not found in index.")]
-        print(f"[DEBUG] handle_call_tool end: {name}, duration={time.time()-_start_time:.4f}s", file=sys.stderr)
-        return res
+            content = await asyncio.to_thread(
+                _with_context(engine.get_document_text),
+                rel_path,
+                section=section,
+            )
+            res = [types.TextContent(type="text", text=content if content else "Document not found in index.")]
+            return res
 
-    elif name == "list_documents":
-        docs = await asyncio.to_thread(_with_context(engine.list_documents))
-        allowed = _get_allowed()
-        if allowed is not None:
-            # パスの最初のディレクトリ部分が許可ルートのもののみ
-            import pathlib
-            docs = [
-                d for d in docs
-                if pathlib.PurePosixPath(d.replace("\\", "/")).parts[0:1]
-                and pathlib.PurePosixPath(d.replace("\\", "/")).parts[0] in allowed
-            ]
-        return [types.TextContent(type="text", text="Indexed Documents:\n" + "\n".join(docs))]
+        elif name == "list_documents":
+            docs = await asyncio.to_thread(_with_context(engine.list_documents))
+            allowed = _get_allowed()
+            if allowed is not None:
+                # パスの最初のディレクトリ部分が許可ルートのもののみ
+                import pathlib
+                filtered_docs = []
+                for d in docs:
+                    parts = pathlib.PurePosixPath(d.replace("\\", "/")).parts
+                    if parts and parts[0] in allowed:
+                        filtered_docs.append(d)
+                docs = filtered_docs
+            return [types.TextContent(type="text", text="Indexed Documents:\n" + "\n".join(docs))]
 
-    elif name == "update_index":
-        force_flag = arguments.get("force", False)
-        regenerate_summaries = arguments.get("regenerate_summaries", False)
+        elif name == "update_index":
+            force_flag = arguments.get("force", False)
+            regenerate_summaries = arguments.get("regenerate_summaries", False)
         
-        with _sync_lock:
-            cur_status = sync_state["status"]
-            if cur_status == "running":
-                return [types.TextContent(type="text", text=(
-                    f"同期が既に実行中です。get_sync_status で確認してください。\n進捗: {sync_state['progress']}"
-                ))]
-            # done/error 状態の場合は idle にリセットして再同期を許可
-            if cur_status in ("done", "error"):
-                sync_state["status"] = "idle"
-                sync_state["progress"] = "開始準備中..."
-                sync_state["last_result"] = None
+            with _sync_lock:
+                cur_status = sync_state["status"]
+                if cur_status == "running":
+                    return [types.TextContent(type="text", text=(
+                        f"同期が既に実行中です。get_sync_status で確認してください。\n進捗: {sync_state['progress']}"
+                    ))]
+                # done/error 状態の場合は idle にリセットして再同期を許可
+                if cur_status in ("done", "error"):
+                    sync_state["status"] = "idle"
+                    sync_state["progress"] = "開始準備中..."
+                    sync_state["last_result"] = None
 
-        # インデックス更新は管理操作のため、ACL制限を適用せず全ドキュメントを対象とする
-        t = threading.Thread(target=_run_sync_background, args=(force_flag, None), daemon=True)
-        t.start()
+            # インデックス更新は管理操作のため、ACL制限を適用せず全ドキュメントを対象とする
+            t = threading.Thread(target=_run_sync_background, args=(force_flag, None), daemon=True)
+            t.start()
         
-        msg = (
-            "インデックスの同期をバックグラウンドで開始しました。\n"
-            "get_sync_status で進捗を確認できます。"
-        )
-        if regenerate_summaries:
-            msg += "\n\n[注意] regenerate_summaries=true が指定されましたが、現時点では構造ベース圧縮（LLM不要）を使用しているため、要約の再生成は不要です。圧縮は取得時に動的に行われます。"
+            msg = (
+                "インデックスの同期をバックグラウンドで開始しました。\n"
+                "get_sync_status で進捗を確認できます。"
+            )
+            if regenerate_summaries:
+                msg += "\n\n[注意] regenerate_summaries=true が指定されましたが、現時点では構造ベース圧縮（LLM不要）を使用しているため、要約の再生成は不要です。圧縮は取得時に動的に行われます。"
         
-        return [types.TextContent(type="text", text=msg)]
+            return [types.TextContent(type="text", text=msg)]
 
-    elif name == "get_sync_status":
-        with _sync_lock:
-            state = dict(sync_state)
-        label = {"idle": "待機中", "running": "同期中", "done": "完了", "error": "エラー"}.get(state["status"], state["status"])
-        text = f"ステータス: {label}\n進捗: {state['progress']}"
-        if state["last_result"]:
-            text += f"\n最終結果: {state['last_result'].get('message', '')}"
-        if state["status"] == "done":
-            text += "\n\n⇒ 前回の同期プロセスは完了しています。新たに追加されたファイルをインデックスに反映させる場合は、再度 update_index を実行してください。"
-        elif state["status"] == "error":
-            text += "\n\n⇒ エラーが発生しました。update_index で再実行できます。"
-        return [types.TextContent(type="text", text=text)]
+        elif name == "get_sync_status":
+            with _sync_lock:
+                state = dict(sync_state)
+            label = {"idle": "待機中", "running": "同期中", "done": "完了", "error": "エラー"}.get(state["status"], state["status"])
+            text = f"ステータス: {label}\n進捗: {state['progress']}"
+            if state["last_result"]:
+                text += f"\n最終結果: {state['last_result'].get('message', '')}"
+            if state["status"] == "done":
+                text += "\n\n⇒ 前回の同期プロセスは完了しています。新たに追加されたファイルをインデックスに反映させる場合は、再度 update_index を実行してください。"
+            elif state["status"] == "error":
+                text += "\n\n⇒ エラーが発生しました。update_index で再実行できます。"
+            return [types.TextContent(type="text", text=text)]
 
-    else:
-        raise ValueError(f"Unknown tool: {name}")
+        else:
+            return [types.TextContent(type="text", text=f"Error: Unknown tool '{name}'.")]
+    finally:
+        print(f"[DEBUG] handle_call_tool end: name={name}, duration={time.time()-_start_time:.4f}s", file=sys.stderr)
 
 
 async def main():
+    global engine
+
+    try:
+        print("Initializing RAG Engine...", file=sys.stderr)
+        engine = RagEngine()
+    except Exception as e:
+        print(f"Fatal error during engine initialization: {e}", file=sys.stderr)
+        sys.exit(1)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     init_options = InitializationOptions(
         server_name="local-rag-server",
@@ -447,6 +470,12 @@ async def main():
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, init_options)
     else:
+        from mcp.server.sse import SseServerTransport
+        from starlette.applications import Starlette
+        from starlette.routing import Route, Mount
+        from starlette.responses import Response
+        from starlette.middleware.cors import CORSMiddleware
+        import uvicorn
         sse = SseServerTransport("/messages/")
 
         async def handle_sse(request):
@@ -520,7 +549,7 @@ async def main():
                                 sid = qs.get("session_id", [None])[0]
                                 if sid:
                                     current_sid = sid
-                                    _session_registry[sid] = {"allowed": allowed, "default_roots": default_roots, "default_categories": default_categories}
+                                    _session_registry[sid] = {"allowed": allowed, "default_roots": default_roots, "default_categories": default_categories, "created_at": time.time()}
                                     print(f"Registered session {sid[:8]}... allowed={allowed}", file=sys.stderr)
                             except Exception as e:
                                 print(f"Session parse error: {e}", file=sys.stderr)

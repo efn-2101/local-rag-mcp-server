@@ -9,6 +9,7 @@
   
   "ollama_base_url": "http://localhost:11434",
   "extra_text_extensions": [".conf", ".ini", ".env", ".log"],
+  "chunk_overlap": 100,
   "db_dir": "./chroma_db",
   "collection_name": "mcp_rag_collection",
   

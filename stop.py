@@ -15,7 +15,7 @@ def stop_server():
                 continue
                 
             if cmdline:
-                cmd_str = ' '.join(cmdline).lower()
+                cmd_str = ' '.join(str(c) for c in cmdline).lower()
                 # Pythonプロセスであり、コマンドラインに 'server.py' を含んでいるか確認
                 if 'python' in proc.info.get('name', '').lower() and 'server.py' in cmd_str:
                     print(f"MCPサーバーを停止しています... (PID: {pid})")
