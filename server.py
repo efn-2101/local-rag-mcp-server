@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 os.environ["CHROMA_TELEMETRY"] = "FALSE"
 os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
@@ -12,7 +13,7 @@ from contextvars import ContextVar
 from mcp.server.models import InitializationOptions
 from mcp.server import Server, NotificationOptions
 import mcp.types as types
-from rag_engine import RagEngine
+from rag_engine import RagEngine, _normalize_path
 from pathlib import Path
 from typing import Optional, Union, Any
 import functools
@@ -167,30 +168,84 @@ sync_state: dict = {"status": "idle", "progress": "", "last_result": None}
 _sync_lock = threading.Lock()
 
 def _run_sync_background(force: bool, allowed_roots: Optional[set]):
-    def on_progress(phase, current, total, filename):
-        if phase == "converting":
-            pct = int(current / total * 100) if total > 0 else 0
-            msg = f"{filename}: {current}/{total}ページ ({pct}%) [OCR変換中]"
-        elif phase == "indexing":
-            msg = f"{filename} [DB登録中...]"
-        else:
-            msg = f"{filename}: {current}/{total}"
-        with _sync_lock:
-            sync_state["progress"] = msg
-
+    import subprocess
+    import sys
+    
     with _sync_lock:
         sync_state.update({"status": "running", "progress": "開始しました...", "last_result": None})
 
     try:
-        result = engine.sync_documents(
-            force=force,
-            allowed_roots=allowed_roots,
-            progress_callback=on_progress,
+        script_path = Path(__file__).parent / "update_index.py"
+        cmd = [sys.executable, str(script_path)]
+        if force:
+            cmd.append("--force")
+            
+        # subprocess.PIPE で stdout/stderr をキャプチャし、親プロセスに流し込む
+        # Cレベルの出力もすべてここでキャプチャされ、親プロセスのsys.stdoutには行かない
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1
         )
-        with _sync_lock:
-            sync_state["status"] = "done" if result["status"] == "success" else "error"
-            sync_state["progress"] = result["message"]
-            sync_state["last_result"] = result
+        
+        last_result = None
+        if process.stdout is not None:
+            for line in iter(process.stdout.readline, ''):
+                line_stripped = line.strip()
+                if not line_stripped:
+                    continue
+                    
+                if line_stripped.startswith("SYNC_UPDATE_JSON:"):
+                    try:
+                        data = json.loads(line_stripped[len("SYNC_UPDATE_JSON:"):])
+                        if data.get("type") == "progress":
+                            phase = data.get("phase")
+                            current = data.get("current")
+                            total = data.get("total")
+                            filename = data.get("filename")
+                            
+                            if phase == "converting":
+                                pct = int(current / total * 100) if total > 0 else 0
+                                msg = f"{filename}: {current}/{total}ページ ({pct}%) [OCR変換中]"
+                            elif phase == "indexing":
+                                msg = f"{filename} [DB登録中...]"
+                            else:
+                                msg = f"{filename}: {current}/{total}"
+                                
+                            with _sync_lock:
+                                sync_state["progress"] = msg
+                                
+                        elif data.get("type") == "result":
+                            last_result = data.get("data")
+                    except Exception as e:
+                        print(f"Failed to parse progress from subprocess: {e}", file=sys.stderr)
+                else:
+                    # デバッグログや Cレベルの警告は stderr に逃がす (stdio 通信を壊さない)
+                    print(f"[update_index_proc] {line_stripped}", file=sys.stderr)
+                
+        process.wait()
+        
+        if process.returncode == 0 and last_result:
+            if last_result.get("status") == "success" and engine is not None:
+                try:
+                    engine._init_bm25_index()
+                except Exception as e:
+                    print(f"Failed to reload BM25 index after sync: {e}", file=sys.stderr)
+            with _sync_lock:
+                sync_state["status"] = "done" if last_result["status"] == "success" else "error"
+                sync_state["progress"] = last_result["message"]
+                sync_state["last_result"] = last_result
+        else:
+            with _sync_lock:
+                err_msg = f"サブプロセスが異常終了しました (終了コード: {process.returncode})"
+                if last_result and last_result.get("message"):
+                    err_msg = last_result["message"]
+                sync_state.update({"status": "error", "progress": err_msg,
+                                   "last_result": {"status": "error", "message": err_msg}})
     except Exception as e:
         with _sync_lock:
             sync_state.update({"status": "error", "progress": str(e),
@@ -352,9 +407,10 @@ async def handle_call_tool(
             try:
                 # engine.docs_dir は RagEngine 初期化時に resolve 済み
                 requested_path = (engine.docs_dir / doc_path).resolve()
-                if not str(requested_path).startswith(str(engine.docs_dir)):
+                # BUG-03 fix: startswith ではなく is_relative_to を使用（末尾セパレータ対策）
+                if not requested_path.is_relative_to(engine.docs_dir):
                     return [types.TextContent(type="text", text="Access denied: path traversal detected.")]
-            
+
                 # 相対パスに戻して ACL チェック
                 rel_path = str(requested_path.relative_to(engine.docs_dir)).replace("\\", "/")
             except Exception as e:

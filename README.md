@@ -496,6 +496,24 @@ Register-ScheduledTask -TaskName "LocalRagIndexUpdate" `
   -RunLevel Highest -Force
 ```
 
+### 6.1 ハッシュベースOCRスキップと .source_hashes.json の仕様
+
+OCR処理は時間がかかるため、本システムでは `.source_hashes.json` を用いて元ファイルの内容に変更がない（ハッシュ値が同一）場合はOCR処理を自動的にスキップします。
+
+#### `.source_hashes.json` の仕様と生成場所
+
+- **自動生成（通常運用時）**
+  `update_index.py` などによるインデックス更新時、RAGエンジンが各ドキュメントのハッシュ値を計算し、`config.json` で指定した `db_dir`（デフォルトは `chroma_db`）直下の `.source_hashes.json` に自動保存・更新します。
+
+- **手動生成（移行用）**
+  すでに Markdown に変換済みの環境において、次回以降の不要なOCR処理を避けるため、事前にハッシュファイルのみを一括生成することができます。
+  ```bash
+  python _generate_source_hashes.py
+  ```
+
+- **生成場所の整合性**
+  自動生成（`update_index.py`）の場合も、手動生成（`_generate_source_hashes.py`）の場合も、**全く同じ場所（`db_dir` 配下の `.source_hashes.json`）** に生成されます。そのため手動生成を行っても、ソースコードからは正常に参照・比較が行われ、OCRスキップが正しく機能します。
+
 ## 7. ファイル監視による自動インデックス更新（上級者向け）
 
 `file_watcher.py` は `watchdog` ライブラリを使ってソースフォルダを常時監視し、ファイルの追加・更新・削除・移動を検知すると **即座にインデックスを更新**するスクリプトです。

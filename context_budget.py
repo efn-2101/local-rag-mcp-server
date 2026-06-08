@@ -73,10 +73,11 @@ class ContextBudget:
         generation_reserve: Optional[int] = None,
         safety_margin_ratio: Optional[float] = None,
     ):
-        self.max_context = max_context_tokens or self.DEFAULT_MAX_CONTEXT
-        self.system_reserve = system_reserve or self.DEFAULT_SYSTEM_RESERVE
-        self.generation_reserve = generation_reserve or self.DEFAULT_GENERATION_RESERVE
-        self.safety_margin = int(self.max_context * (safety_margin_ratio or self.DEFAULT_SAFETY_MARGIN_RATIO))
+        self.max_context = self.DEFAULT_MAX_CONTEXT if max_context_tokens is None else max_context_tokens
+        self.system_reserve = self.DEFAULT_SYSTEM_RESERVE if system_reserve is None else system_reserve
+        self.generation_reserve = self.DEFAULT_GENERATION_RESERVE if generation_reserve is None else generation_reserve
+        ratio = self.DEFAULT_SAFETY_MARGIN_RATIO if safety_margin_ratio is None else safety_margin_ratio
+        self.safety_margin = int(self.max_context * ratio)
     
     def get_available_budget(self, history_tokens: int = 0) -> int:
         """
@@ -540,36 +541,48 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
     """
     テキストを指定トークン数以内に切り詰める。
     文の途中で切らないよう、句読点で区切る。
-    
+
     Args:
         text: 切り詰めるテキスト
         max_tokens: 最大トークン数
-    
+
     Returns:
         切り詰められたテキスト
     """
-    tokens = count_tokens(text)
-    if tokens <= max_tokens:
-        return text
-    
-    # バイナリサーチで切り詰め位置を探す
-    low, high = 0, len(text)
-    while low < high:
-        mid = (low + high + 1) // 2
-        if count_tokens(text[:mid]) <= max_tokens:
-            low = mid
-        else:
-            high = mid - 1
-    
-    # 文の途中で切らないよう、最後の句読点を探す
-    truncated = text[:low]
+    if not text or max_tokens <= 0:
+        return "" if max_tokens == 0 else text
+
+    # tiktoken がある場合: O(n) で切り詰め（encode + slice + decode の1回ずつ）
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        token_ids = enc.encode(text)
+        if len(token_ids) <= max_tokens:
+            return text
+        # 1回の encode + スライス + 1回の decode
+        truncated_text = enc.decode(token_ids[:max_tokens])
+    except ImportError:
+        # tiktoken なし: 既存の二分探索にフォールバック（O(n log n) だが妥協）
+        total_tokens = count_tokens(text)
+        if total_tokens <= max_tokens:
+            return text
+        low, high = 0, len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if count_tokens(text[:mid]) <= max_tokens:
+                low = mid
+            else:
+                high = mid - 1
+        truncated_text = text[:low]
+
+    # 句読点での区切り
     for punct in '。！？.!?\n':
-        last_punct = truncated.rfind(punct)
-        if last_punct > len(truncated) * 0.5:  # 半分以上は残す
-            truncated = truncated[:last_punct + 1]
+        last_punct = truncated_text.rfind(punct)
+        if last_punct > len(truncated_text) * 0.5:
+            truncated_text = truncated_text[:last_punct + 1]
             break
-    
-    return truncated + "\n...[以下省略]..."
+
+    return truncated_text + "\n...[以下省略]..."
 
 
 def get_document_stats(text: str) -> Dict[str, Any]:

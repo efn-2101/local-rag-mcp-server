@@ -19,7 +19,8 @@ class DocumentHandler(FileSystemEventHandler):
         try:
             p = Path(abs_path).resolve()
             docs_dir = self.engine.docs_dir.resolve()
-            if not str(p).startswith(str(docs_dir)):
+            # BUG-03-2 fix: startswith ではなく is_relative_to を使用（末尾セパレータ対策）
+            if not p.is_relative_to(docs_dir):
                 return None
             return p.relative_to(docs_dir)
         except Exception:
@@ -33,10 +34,9 @@ class DocumentHandler(FileSystemEventHandler):
                     return
                 normalized_path = Path(_normalize_path(str(rel_path)))
                 print(f"File modified: {normalized_path}", file=sys.stderr)
-                if self.engine.has_document_changed(normalized_path):
-                    self.engine.add_document(normalized_path)
-                else:
-                    print(f"Skipped re-indexing (content unchanged): {normalized_path}", file=sys.stderr)
+                # BUG-01 fix: has_document_changed() は未定義。docs_dir を基準にした絶対パスを渡す
+                # 変更検知は add_document() 内部で実施される
+                self.engine.add_document(self.engine.docs_dir / normalized_path)
             except Exception as e:
                 print(f"Error handling modification for {event.src_path}: {e}", file=sys.stderr)
 
@@ -48,7 +48,8 @@ class DocumentHandler(FileSystemEventHandler):
                     return
                 normalized_path = Path(_normalize_path(str(rel_path)))
                 print(f"File created: {normalized_path}", file=sys.stderr)
-                self.engine.add_document(normalized_path)
+                # BUG-01 fix: docs_dir を基準にした絶対パスを渡す
+                self.engine.add_document(self.engine.docs_dir / normalized_path)
             except Exception as e:
                 print(f"Error handling creation for {event.src_path}: {e}", file=sys.stderr)
 
@@ -60,8 +61,8 @@ class DocumentHandler(FileSystemEventHandler):
                     return
                 normalized_path = Path(_normalize_path(str(rel_path)))
                 print(f"File deleted: {normalized_path}", file=sys.stderr)
-                # delete_documentは相対パスが必要
-                self.engine.delete_document(normalized_path)
+                # BUG-01 fix: delete_document も絶対パスで動作する（内部で relative_to を呼ぶ）
+                self.engine.delete_document(self.engine.docs_dir / normalized_path)
             except Exception as e:
                 print(f"Error handling deletion for {event.src_path}: {e}", file=sys.stderr)
 
@@ -72,11 +73,12 @@ class DocumentHandler(FileSystemEventHandler):
                 dest_rel = self._to_relative_path(event.dest_path)
                 if src_rel is None or dest_rel is None:
                     return
+                # BUG-01 fix: 型一貫性のため両側とも Path オブジェクト
                 src_normalized = Path(_normalize_path(str(src_rel)))
                 dest_normalized = Path(_normalize_path(str(dest_rel)))
                 print(f"File moved from {src_normalized} to {dest_normalized}", file=sys.stderr)
-                self.engine.delete_document(src_normalized)
-                self.engine.add_document(dest_normalized)
+                self.engine.delete_document(self.engine.docs_dir / src_normalized)
+                self.engine.add_document(self.engine.docs_dir / dest_normalized)
             except Exception as e:
                 print(f"Error handling move from {event.src_path} to {event.dest_path}: {e}", file=sys.stderr)
 

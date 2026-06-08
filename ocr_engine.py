@@ -138,42 +138,61 @@ class PaddleOCREngine(OCREngine):
     def __init__(self, use_gpu: bool = False):
         self.use_gpu = use_gpu
         self._instance = None
-    
+        self._actual_gpu = False  # BUG-04 fix: 実際の動作モードを保持
+
     def is_available(self) -> bool:
         return PADDLE_OCR_AVAILABLE
-    
+
     def get_name(self) -> str:
-        return f"PaddleOCR (GPU={'enabled' if self.use_gpu else 'disabled'})"
-    
+        # BUG-04 fix: 設定と実際の動作モードを区別して表示
+        return f"PaddleOCR (config=GPU={'enabled' if self.use_gpu else 'disabled'}, actual={'GPU' if self._actual_gpu else 'CPU'})"
+
     def _initialize(self) -> bool:
-        """PaddleOCRインスタンスを初期化"""
+        """PaddleOCRインスタンスを初期化（BUG-04 fix: 3段階フォールバック）"""
         if self._instance is not None:
             return True
-        
+
         if not PADDLE_OCR_AVAILABLE:
             return False
-        
-        try:
-            # PaddleOCR v2.9+ via PaddleX might not accept use_gpu directly
+
+        # 試行1: use_gpu パラメータ + GPU設定
+        if self.use_gpu:
             try:
                 self._instance = PaddleOCR(
-                    use_angle_cls=True, 
-                    lang='japan', 
-                    use_gpu=self.use_gpu, 
+                    use_angle_cls=True,
+                    lang='japan',
+                    use_gpu=True,
                     show_log=False
                 )
-            except (ValueError, TypeError):
-                # Fallback for PaddleOCR v2.9+
-                device = 'gpu' if self.use_gpu else 'cpu'
-                self._instance = PaddleOCR(
-                    use_angle_cls=True, 
-                    lang='japan', 
-                    device=device
-                )
+                self._actual_gpu = True
+                return True
+            except Exception as e:
+                print(f"PaddleOCR GPU init failed, falling back to CPU: {e}", file=sys.stderr)
+
+        # 試行2: device='cpu' 明示指定
+        try:
+            self._instance = PaddleOCR(
+                use_angle_cls=True,
+                lang='japan',
+                device='cpu'
+            )
+            self._actual_gpu = False
             return True
-        except Exception as e:
-            print(f"Failed to initialize PaddleOCR: {e}", file=sys.stderr)
-            return False
+        except (ValueError, TypeError) as e:
+            # 試行3: 旧 API (use_gpu=False)
+            print(f"PaddleOCR device='cpu' init failed, trying legacy API: {e}", file=sys.stderr)
+            try:
+                self._instance = PaddleOCR(
+                    use_angle_cls=True,
+                    lang='japan',
+                    use_gpu=False,
+                    show_log=False
+                )
+                self._actual_gpu = False
+                return True
+            except Exception as e2:
+                print(f"PaddleOCR initialization completely failed: {e2}", file=sys.stderr)
+                return False
     
     def perform_ocr_from_bytes(self, image_data: bytes) -> str:
         if not self._initialize():

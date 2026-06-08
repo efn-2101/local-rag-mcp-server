@@ -62,6 +62,7 @@ RUN mkdir -p /app/documents /app/converted_docs /app/chroma_db /app/models/flash
 # 環境変数
 ENV PYTHONUNBUFFERED=1
 ENV CHROMA_TELEMETRY=FALSE
+ENV ANONYMIZED_TELEMETRY=FALSE
 
 # ポート公開
 EXPOSE 8000

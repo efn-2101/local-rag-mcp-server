@@ -128,20 +128,24 @@ class FileConverter:
             print(f"Error reading PPTX {file_path}: {e}", file=sys.stderr)
             return ""
 
-    def convert_file(self, file_path: Path, output_path: Path, progress_callback=None):
+    def convert_file(self, file_path: Path, output_path: Path, progress_callback=None, skip_mtime_check: bool = False):
         """ファイルを変換してMarkdownとして保存する。
         戻り値:
             True  - 変換・保存に成功
             False - スキップ（未サポート形式・タイムスタンプが新しいので変換不要）
             None  - 変換を試みたがOCR失敗等でコンテンツが取得できなかった
+        Args:
+            skip_mtime_check: Trueの場合、内部のmtimeチェックをスキップする。
+                              sync_documents経由での呼び出し時はハッシュチェック済みのためTrueを指定する。
         """
         if file_path.name.startswith("~$"):
             return False
-            
-        if output_path.exists():
-            if output_path.stat().st_mtime > file_path.stat().st_mtime:
-                print(f"Skipping {file_path.name} (uptodate)", file=sys.stderr)
-                return False
+
+        if not skip_mtime_check:
+            if output_path.exists():
+                if output_path.stat().st_mtime > file_path.stat().st_mtime:
+                    print(f"Skipping {file_path.name} (uptodate)", file=sys.stderr)
+                    return False
 
         print(f"Converting {file_path.name}...", file=sys.stderr)
         attempted = False  # 変換を試みたかどうか
@@ -228,10 +232,13 @@ def main():
         if file_path.is_file():
             # Calculate output path preserving subdirectory structure
             rel_path = file_path.relative_to(docs_dir)
-            # Replace extension with .md for the output file
-            # If original file is .md, avoiding conflict is good, but typically we map .pdf -> .md
-            # If we have foo.pdf, we get foo.md.
-            output_rel_path = rel_path.with_suffix(".md")
+            # .mdファイルはそのまま、それ以外は元の拡張子を保持した上で.mdを追加
+            # 例: report.pdf -> report.pdf.md, report.md -> report.md
+            # これにより同名の.mdと.pdfが存在しても衝突しない
+            if rel_path.suffix.lower() == ".md":
+                output_rel_path = rel_path
+            else:
+                output_rel_path = Path(str(rel_path) + ".md")
             output_path = output_dir / output_rel_path
             
             # Convert (will check timestamp inside)
@@ -243,7 +250,7 @@ def main():
     # 2. Cleanup: Remove orphaned markdown files in converted_docs
     # Only iterate if we effectively scanned documents.
     print(f"Checking for deleted files in {output_dir}...", file=sys.stderr)
-    for md_file in output_dir.rglob("*.md"):
+    for md_file in list(output_dir.rglob("*.md")):
         if md_file.is_file():
             if md_file.resolve() not in valid_markdown_files:
                 print(f"Removing orphaned file: {md_file}", file=sys.stderr)
@@ -252,11 +259,15 @@ def main():
                     # Try to remove empty parent directories
                     parent = md_file.parent
                     while parent != output_dir:
+                        if not parent.exists():
+                            break
                         if not any(parent.iterdir()):
                             parent.rmdir()
                             parent = parent.parent
                         else:
                             break
+                except FileNotFoundError as e:
+                    print(f"Orphan cleanup skipped missing path for {md_file}: {e}", file=sys.stderr)
                 except Exception as e:
                     print(f"Error removing {md_file}: {e}", file=sys.stderr)
 

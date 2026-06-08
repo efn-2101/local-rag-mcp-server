@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 os.environ["CHROMA_TELEMETRY"] = "FALSE"
 os.environ["ANONYMIZED_TELEMETRY"] = "FALSE"
@@ -10,9 +11,10 @@ import glob
 import re
 import hashlib
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Union
 import ollama
 import chromadb
+from chromadb.config import Settings
 from rank_bm25 import BM25Okapi
 from flashrank import Ranker, RerankRequest
 
@@ -26,6 +28,14 @@ from context_budget import (
     fit_search_results_to_budget,
     truncate_to_tokens,
 )
+
+
+def _local_chroma_settings() -> Settings:
+    """Force ChromaDB to use a local persistent client with telemetry disabled."""
+    return Settings(
+        anonymized_telemetry=False,
+        chroma_otel_collection_endpoint="",
+    )
 
 
 def _normalize_path(path_str: str) -> str:
@@ -69,7 +79,7 @@ def _compute_text_hash(text: str) -> str:
 
 
 class RagEngine:
-    def __init__(self, config_path: str = "config.json"):
+    def __init__(self, config_path: str = "config.json", init_bm25: bool = True):
         # Resolve config_path relative to this script's directory
         base_dir = Path(__file__).parent.absolute()
         
@@ -151,12 +161,19 @@ class RagEngine:
         # BM25 index attributes (will be initialized in sync_documents)
         self.bm25_index: Optional[BM25Okapi] = None
         self.bm25_texts: List[str] = []
+        # BUG-06 fix: ID/メタデータキャッシュと有効フラグを追加
+        self.bm25_ids: List[str] = []
+        self.bm25_metadatas: List[Dict] = []
+        self.bm25_cache_valid: bool = False
         
         # FlashRank ranker (will be initialized safely)
         self.ranker: Optional[Ranker] = None
         
         try:
-            self.client = chromadb.PersistentClient(path=str(db_path))
+            self.client = chromadb.PersistentClient(
+                path=str(db_path),
+                settings=_local_chroma_settings(),
+            )
             self.collection = self.client.get_or_create_collection(
                 name=self.config["collection_name"]
             )
@@ -181,7 +198,10 @@ class RagEngine:
             
             # Re-initialize
             db_path.mkdir(parents=True, exist_ok=True)
-            self.client = chromadb.PersistentClient(path=str(db_path))
+            self.client = chromadb.PersistentClient(
+                path=str(db_path),
+                settings=_local_chroma_settings(),
+            )
             self.collection = self.client.get_or_create_collection(
                 name=self.config["collection_name"]
             )
@@ -190,12 +210,13 @@ class RagEngine:
         self._init_flashrank_ranker(base_dir)
         
         # Source file hash tracking for avoiding redundant OCR
-        self.source_hashes_path = db_path.parent / ".source_hashes.json"
+        self.source_hashes_path = db_path / ".source_hashes.json"
         self.source_hashes: Dict[str, str] = {}
         self._load_source_hashes()
         
         # Initialize BM25 index from existing documents
-        self._init_bm25_index()
+        if init_bm25:
+            self._init_bm25_index()
 
     def _load_source_hashes(self):
         """元ファイルのハッシュ状態を読み込む"""
@@ -313,19 +334,43 @@ class RagEngine:
         return result
 
     def _init_bm25_index(self):
-        """既存のドキュメントから BM25 インデックスを初期化"""
+        """
+        既存のドキュメントから BM25 インデックスを初期化（BUG-06 fix: キャッシュ付き）
+        sync_documents() の最後でも呼ばれる（_build_bm25_corpus の役割を統合）
+        """
         try:
-            result = self._safe_collection_get(include=["documents"])
+            result = self._safe_collection_get(include=["documents", "metadatas"])
             if result and result["documents"]:
-                self.bm25_texts = result["documents"]
-                if self.bm25_texts:
-                    # Tokenize documents for BM25
-                    tokenized_docs = [self._tokenize_text(text) for text in self.bm25_texts]
-                    self.bm25_index = BM25Okapi(tokenized_docs)
+                bm25_texts = result["documents"]
+                bm25_ids = result["ids"]
+                bm25_metadatas = result["metadatas"]
+                tokenized_docs = [self._tokenize_text(text) for text in bm25_texts]
+                bm25_index = BM25Okapi(tokenized_docs)
+
+                self.bm25_texts = bm25_texts
+                self.bm25_ids = bm25_ids
+                self.bm25_metadatas = bm25_metadatas
+                self.bm25_index = bm25_index
+                self.bm25_cache_valid = True
+            else:
+                # コレクションが空: キャッシュを空に
+                self.bm25_texts = []
+                self.bm25_ids = []
+                self.bm25_metadatas = []
+                self.bm25_cache_valid = True
+                self.bm25_index = None
         except Exception as e:
             print(f"Error initializing BM25 index: {e}", file=sys.stderr)
             self.bm25_index = None
             self.bm25_texts = []
+            self.bm25_ids = []
+            self.bm25_metadatas = []
+            self.bm25_cache_valid = False
+
+    # BUG-06 fix: _build_bm25_corpus は _init_bm25_index に統合
+    def _build_bm25_corpus(self):
+        """互換性のためのエイリアス（実装は _init_bm25_index に統一）"""
+        self._init_bm25_index()
 
     def _tokenize_text(self, text: str) -> List[str]:
         """テキストをトークン化（日本語・英語対応）"""
@@ -334,20 +379,6 @@ class RagEngine:
         # 英数・記号を空白で分割
         tokens = re.findall(r'[a-zA-Z0-9]+|[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', text)
         return tokens
-
-    def _build_bm25_corpus(self):
-        """ChromaDB のドキュメントから BM25 コーパスを再構築"""
-        try:
-            result = self._safe_collection_get(include=["documents"])
-            if result and result["documents"]:
-                self.bm25_texts = result["documents"]
-                if self.bm25_texts:
-                    tokenized_docs = [self._tokenize_text(text) for text in self.bm25_texts]
-                    self.bm25_index = BM25Okapi(tokenized_docs)
-        except Exception as e:
-            print(f"Error building BM25 corpus: {e}", file=sys.stderr)
-            self.bm25_index = None
-            self.bm25_texts = []
 
     def get_embedding(self, text: str) -> List[float]:
         try:
@@ -408,42 +439,50 @@ class RagEngine:
         print(f"[DEBUG] chunk_text: created {len(chunks)} chunks", file=sys.stderr)
         return chunks
 
-    def add_document(self, file_path: Path):
-        """ファイルをインデックスに追加する (チャンク分割あり)"""
+    def add_document(self, file_path: Path) -> int:
+        """
+        ファイルをインデックスに追加する (チャンク分割あり)
+
+        Returns:
+            失敗したチャンク数（0 = 成功または変更なし/処理対象外）
+        """
+        error_count = 0
         if not file_path.is_file():
-            return
+            return 0
             
         # Only process markdown/text files for now
         if file_path.suffix.lower() not in self.allowed_extensions:
-            return
+            return 0
 
         category = file_path.parent.name if file_path.parent != self.docs_dir else "default"
         # パスを正規化（バックスラッシュ→スラッシュ、全角空白→半角空白、連続空白圧縮）
         rel_path = _normalize_path(str(file_path.relative_to(self.docs_dir)))
         rel_parts = file_path.relative_to(self.docs_dir).parts
         root_folder = _normalize_path(rel_parts[0]) if len(rel_parts) > 0 else "default"
-        
+
         # Get file modified time
         mtime = os.path.getmtime(file_path)
-        
+
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
         except Exception as e:
             print(f"Error reading {file_path}: {e}", file=sys.stderr)
-            return
-        
+            return 0
+
         if not content.strip():
-            return
+            return 0
 
         # Compute content hash for change detection
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-        # Delete existing chunks for this file first
-        self.delete_document(file_path)
-
         chunks = self.chunk_text(content)
         print(f"Indexing {rel_path} ({len(content)} chars) -> {len(chunks)} chunks", file=sys.stderr)
+
+        prepared_ids = []
+        prepared_embeddings = []
+        prepared_metadatas = []
+        prepared_documents = []
         
         for i, chunk in enumerate(chunks):
             # ID はフォワードスラッシュ正規化された rel_path を使用
@@ -451,51 +490,45 @@ class RagEngine:
             
             try:
                 embedding = self.get_embedding(chunk)
-                
-                self.collection.upsert(
-                    ids=[chunk_id],
-                    embeddings=[embedding],
-                    metadatas=[{"root_folder": root_folder, "category": category, "path": rel_path, "chunk_index": i, "overlap": self.config.get("chunk_overlap", 100), "mtime": mtime, "content_hash": content_hash}],
-                    documents=[chunk]
-                )
+                prepared_ids.append(chunk_id)
+                prepared_embeddings.append(embedding)
+                prepared_metadatas.append({"root_folder": root_folder, "category": category, "path": rel_path, "chunk_index": i, "overlap": self.config.get("chunk_overlap", 100), "mtime": mtime, "content_hash": content_hash})
+                prepared_documents.append(chunk)
             except Exception as e:
+                # BUG-18 fix: チャンク単位のエラーをカウンタに加算
+                error_count += 1
                 print(f"CRITICAL ERROR indexing chunk {i} of {rel_path} (len={len(chunk)}): {e}", file=sys.stderr)
                 # If 500 error, print response if possible
                 if hasattr(e, "response"):
                      print(f"Response: {e.response.text if hasattr(e.response, 'text') else e.response}", file=sys.stderr)
-        
-    def has_document_changed(self, file_path: Path) -> bool:
-        """
-        ファイル内容がDBに保存されているものと異なるかをチェック。
-        ハッシュベースで判定し、ハッシュがない場合はmtimeフォールバック。
-        """
-        if not file_path.is_file():
-            return True
-        
-        rel_path = _normalize_path(str(file_path.relative_to(self.docs_dir)))
-        
+
+        if error_count > 0:
+            print(f"Aborted indexing {rel_path}: prepared {len(prepared_ids)}/{len(chunks)} chunks. Existing index was left unchanged.", file=sys.stderr)
+            return error_count
+
+        # TASK-AUDIT-001: Replace the document only after every replacement
+        # chunk and embedding has been prepared successfully. This prevents a
+        # failed reindex from deleting the previous good indexed document.
+        self.delete_document(file_path)
+
         try:
-            result = self._safe_collection_get(where={"path": rel_path}, include=["metadatas"])
-            if result and result["metadatas"]:
-                db_hash = result["metadatas"][0].get("content_hash", "")
-                if db_hash:
-                    # BUG-002 fix: Use text hash instead of binary file hash
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            content = f.read()
-                        current_hash = _compute_text_hash(content)
-                        return current_hash != db_hash
-                    except Exception as e:
-                        print(f"Error reading file for hash comparison {rel_path}: {e}", file=sys.stderr)
-                        return True
-                # Fallback to mtime for backward compatibility
-                db_mtime = result["metadatas"][0].get("mtime", 0.0)
-                file_mtime = os.path.getmtime(file_path)
-                return file_mtime > db_mtime + 1.0
+            self.collection.upsert(
+                ids=prepared_ids,
+                embeddings=prepared_embeddings,
+                metadatas=prepared_metadatas,
+                documents=prepared_documents
+            )
         except Exception as e:
-            print(f"Error checking document change for {rel_path}: {e}", file=sys.stderr)
-        
-        return True
+            error_count += len(prepared_ids) if prepared_ids else 1
+            print(f"CRITICAL ERROR upserting prepared chunks for {rel_path} (chunks={len(prepared_ids)}): {e}", file=sys.stderr)
+            if hasattr(e, "response"):
+                 print(f"Response: {e.response.text if hasattr(e.response, 'text') else e.response}", file=sys.stderr)
+            return error_count
+
+        # BUG-06 fix: BM25 キャッシュを無効化（次回の BM25 検索時に再構築される）
+        self.bm25_cache_valid = False
+        # BUG-18 fix: 失敗したチャンク数を返す
+        return error_count
 
     def delete_document(self, file_path: Path):
         """ファイルをインデックスから削除する"""
@@ -510,7 +543,10 @@ class RagEngine:
                 print(f"Deleted from index: {rel_path} ({len(results['ids'])} chunks)", file=sys.stderr)
         except Exception as e:
             print(f"Error deleting {rel_path}: {e}", file=sys.stderr)
-        
+
+        # BUG-06 fix: BM25 キャッシュを無効化
+        self.bm25_cache_valid = False
+
     def _rrf_fusion(self, dense_results: List[Dict[str, Any]], sparse_results: List[Dict[str, Any]], k: int = 60) -> List[Dict[str, Any]]:
         """
         RRF (Reciprocal Rank Fusion) を用いて 2 つの検索結果を統合
@@ -567,21 +603,23 @@ class RagEngine:
         return rrf_scores
 
     def _bm25_search(self, query: str, n_results: int, root_folder: Optional[str] = None) -> List[Dict[str, Any]]:
-        """BM25 キーワード検索を実行"""
-        if not self.bm25_index or not self.bm25_texts:
+        """BM25 キーワード検索を実行（BUG-06 fix: キャッシュ使用 + 遅延再構築）"""
+        # BUG-06 fix: キャッシュが無効なら遅延再構築
+        if not self.bm25_cache_valid:
+            self._init_bm25_index()
+
+        if not self.bm25_index:
             return []
-        
+
         # Tokenize query
         tokenized_query = self._tokenize_text(query)
-        
+
         # Get BM25 scores
         bm25_scores = self.bm25_index.get_scores(tokenized_query)
-        
-        # Get all IDs to map back
-        all_data = self._safe_collection_get(include=["documents", "metadatas"])
-        all_ids = all_data["ids"]
-        all_docs = all_data["documents"]
-        all_metas = all_data["metadatas"]
+
+        # BUG-06 fix: キャッシュから取得（フルスキャンしない）
+        all_ids = self.bm25_ids
+        all_metas = self.bm25_metadatas
 
         # Create results with scores
         all_results = []
@@ -589,15 +627,15 @@ class RagEngine:
             if idx < len(all_ids):
                 all_results.append({
                     "id": all_ids[idx],
-                    "content": all_docs[idx],
+                    "content": self.bm25_texts[idx],
                     "metadata": all_metas[idx],
                     "bm25_score": bm25_scores[idx]
                 })
-        
+
         # Filter by root_folder if specified
         if root_folder:
-            all_results = [r for r in all_results if r["metadata"].get("root_folder") == root_folder]
-            
+            all_results = [r for r in all_results if r["metadata"] and r["metadata"].get("root_folder") == root_folder]
+
         # Sort by score and take top n_results
         all_results.sort(key=lambda x: x["bm25_score"], reverse=True)
         return all_results[:n_results]
@@ -1008,7 +1046,13 @@ class RagEngine:
                         if allowed_roots is not None and root_name not in allowed_roots:
                             continue
                         
-                        out_path = self.docs_dir / rel.with_suffix(".md")
+                        # .mdファイルはそのまま、それ以外は元の拡張子を保持した上で.mdを追加
+                        # 例: report.pdf -> report.pdf.md, report.md -> report.md
+                        # これにより同名の.mdと.pdfが存在しても衝突しない
+                        if rel.suffix.lower() == ".md":
+                            out_path = self.docs_dir / rel
+                        else:
+                            out_path = self.docs_dir / (str(rel) + ".md")
                         valid_md_files.add(out_path.resolve())
                         
                         rel_key = _normalize_path(str(rel))
@@ -1040,7 +1084,8 @@ class RagEngine:
                         try:
                             converted = converter.convert_file(
                                 file_path, out_path,
-                                progress_callback=make_pdf_callback(file_path.name)
+                                progress_callback=make_pdf_callback(file_path.name),
+                                skip_mtime_check=True
                             )
                             if converted is True:
                                 results["converted"] = results["converted"] + 1
@@ -1068,7 +1113,7 @@ class RagEngine:
                         print(f"Removed {len(orphaned_hashes)} orphaned hash entries", file=sys.stderr)
                     
                     # 許可カテゴリ内の孤児MDファイルを削除
-                    for md_file in self.docs_dir.rglob("*.md"):
+                    for md_file in list(self.docs_dir.rglob("*.md")):
                         if not md_file.is_file():
                             continue
                         # ACL: 許可カテゴリ外はスキップ
@@ -1078,11 +1123,15 @@ class RagEngine:
                                 md_file.unlink()
                                 parent = md_file.parent
                                 while parent != self.docs_dir:
+                                    if not parent.exists():
+                                        break
                                     if not any(parent.iterdir()):
                                         parent.rmdir()
                                         parent = parent.parent
                                     else:
                                         break
+                            except FileNotFoundError as e:
+                                print(f"Orphan cleanup skipped missing path for {md_file}: {e}", file=sys.stderr)
                             except Exception as e:
                                 print(f"Error removing {md_file}: {e}", file=sys.stderr)
                 else:
@@ -1148,7 +1197,12 @@ class RagEngine:
                         needs_update = True
                     elif rel_path in db_hashes:
                         # Hash-based change detection (preferred)
-                        current_hash = _compute_file_hash(file_path)
+                        # add_document はテキストハッシュ(open "r")で保存しているため比較側も統一する
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                current_hash = _compute_text_hash(f.read())
+                        except Exception:
+                            current_hash = ""
                         needs_update = current_hash != db_hashes[rel_path]
                     else:
                         # Fallback: mtime-based change detection for backward compatibility
@@ -1159,7 +1213,11 @@ class RagEngine:
                         try:
                             if progress_callback:
                                 progress_callback("indexing", 0, 0, rel_path)
-                            self.add_document(file_path)
+                            # BUG-18 fix: チャンク単位のエラー件数を results["errors"] に加算
+                            chunk_errors = self.add_document(file_path)
+                            if chunk_errors > 0:
+                                results["errors"] = results["errors"] + chunk_errors
+                                print(f"Indexed {rel_path} with {chunk_errors} chunk errors", file=sys.stderr)
                             if is_new:
                                 results["added"] = results["added"] + 1
                             else:
@@ -1185,6 +1243,8 @@ class RagEngine:
                 self._save_source_hashes()
                 
                 # BM25 インデックスを同期後に一括更新
+                if progress_callback:
+                    progress_callback("indexing", 0, 0, "BM25コーパスを構築中...")
                 self._build_bm25_corpus()
 
                 results["message"] = f"Sync complete. Converted: {results.get('converted', 0)}, Added: {results.get('added', 0)}, Updated: {results.get('updated', 0)}, Deleted: {results.get('deleted', 0)}, Skipped: {results.get('skipped', 0)} (Errors: {results.get('errors', 0)})"
